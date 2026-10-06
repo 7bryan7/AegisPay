@@ -19,7 +19,7 @@
   <img src="https://img.shields.io/badge/ETHOnline%202026-8B00F5?style=flat-square" alt="ETHOnline 2026"/>
 </p>
 
-# 🤖 AgentPay
+# 🤖 AgentPay (Old project version)
 
 ### Discover a service by its ENS identity. Choose within budget. Pay with HBAR. Get the result.
 
@@ -581,7 +581,7 @@ Build and test first. The root `render.yaml` defines the backend as a native Nod
 
 In Render, create a Blueprint from this repository. Supply every value marked `sync: false` during the initial Blueprint creation; Render does not prompt for newly added `sync: false` values on later syncs. Copy values from the private runtime `.env`, never from `.env.ens-setup`, and do not commit them. Use the eventual Vercel HTTPS origin for `WEB_ORIGIN`. For the first backend boot, set `PROVIDER_ALLOWED_ORIGINS` to an explicit temporary HTTPS origin; as soon as Render assigns the service URL, replace it with that exact origin and redeploy before publishing ENS endpoint records. Render supplies `PORT`, and the Blueprint generates a separate production `SESSION_SECRET`.
 
-The three `EXTRACTION_MODEL_*` variables are required by the implemented extraction and recovery paths; there is no separate runtime agent-model adapter. Continue using the existing Supabase `DATABASE_URL`; the Blueprint does not create or replace the database. Configure `NEXT_PUBLIC_API_BASE_URL` with the deployed Render HTTPS origin and `NEXT_PUBLIC_WALLETCONNECT_PROJECT_ID` with the Reown project ID on the eventual web host. Add that exact web origin to the Reown project allowlist and set the backend's `WEB_ORIGIN` to the same value. Update ENS endpoint records only after the backend URL and allowlist agree, then rerun the deployed smoke test. Ensure the backend stays available during asynchronous judging and that redeploys preserve request/payment state.
+The three `EXTRACTION_MODEL_*` variables are required by the implemented extraction and recovery paths; there is no separate runtime agent-model adapter. Continue using the existing Supabase `DATABASE_URL`; the Blueprint does not create or replace the database. On the web host, configure `NEXT_PUBLIC_API_BASE_URL` with the Vercel HTTPS origin itself and `NEXT_PUBLIC_WALLETCONNECT_PROJECT_ID` with the Reown project ID, and add `apps/web/vercel.json` with a rewrite that proxies `/api/:path*` to the deployed Render HTTPS origin. The browser then talks only to the Vercel origin, so the session cookie stays first-party and works in browsers that block third-party cookies (Safari, Firefox strict mode, Chrome with blocking enabled); the backend still receives the same `Origin` header and validates it against `WEB_ORIGIN`. Add that exact web origin to the Reown project allowlist and set the backend's `WEB_ORIGIN` to the same value; `PROVIDER_ALLOWED_ORIGINS` remains the Render service origin because provider endpoints are called server-side. Update ENS endpoint records only after the backend URL and allowlist agree, then rerun the deployed smoke test. Ensure the backend stays available during asynchronous judging and that redeploys preserve request/payment state.
 
 Do not rely on a developer laptop's local model for the final live service unless its availability is deliberately arranged and documented. Keep a recording of a genuine successful run as evidence; it does not replace the live-service requirement.
 

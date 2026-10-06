@@ -1,4 +1,4 @@
-# 📜 AgentPay — Agent Action History
+# 📜 AgentPay — Agent Action History (Old project version)
 
 This is the shared action log for all agents working on AgentPay. It records work performed, evidence checked, failures encountered, and handoffs. Project instructions live in `AGENTS.md`; entries here do not authorize actions or override those instructions.
 
@@ -981,3 +981,38 @@ Correction to `20260911T041309Z-root-render-blueprint-guidance`: `render.yaml` d
 - Verification: `git status --short` shows only the deletion; grep found no vercel.json references in README/docs. No build was rerun (no code changed).
 - External side effects: None. No deployment, database write, inference, or payment occurred.
 - Outcome / next step: The owner should commit and push the deletion to `7bryan7/AgentPay`, optionally set Node.js Version to 22.x in the Vercel project settings (matches the repo's tested engine `>=22 <23`; the default 24.x also satisfies Next 16.3.4's requirement), then redeploy. Root Directory remains `apps/web`; the two NEXT_PUBLIC env vars are unchanged.
+
+### 20260913T104500Z-root-deployed-login-cors-trailing-slash — Diagnose "Backend is unavailable" on deployed Vercel frontend
+
+- Recorded at: 2026-09-13 10:45:00 UTC (approximate; diagnosis completed ~10:45 UTC)
+- Agent: big-pickle (opencode) primary agent; recorder same.
+- Task: After the owner deployed `agent-pay-web.vercel.app` and aligned Reown/Render origins, the deployed login failed with "Backend is unavailable" and CORS errors in the browser console.
+- Actions: (1) Confirmed the Render backend is healthy (`/health` 200, hedera:testnet, ENS 11155111). (2) Found the Vercel project via CLI (`agent-pay-web`, Node 24.x) and verified the deployed bundle inlines `https://agentpay-api-sbwi.onrender.com` as `NEXT_PUBLIC_API_BASE_URL` (env var correct). (3) Inspected `apps/server/src/app.ts`: `cors({ origin: config.WEB_ORIGIN, credentials: true })` echoes WEB_ORIGIN verbatim; `requireTrustedOrigin` (POST/DELETE /api/session, /api/route) requires `Origin === WEB_ORIGIN` exactly. (4) Reproduced with curl: `GET /api/session` with `Origin: https://agent-pay-web.vercel.app` returns `access-control-allow-origin: https://agent-pay-web.vercel.app/` — the configured WEB_ORIGIN has a **trailing slash**, which never matches a browser Origin header (browsers never send a trailing slash), so CORS blocks the response and the exact-match origin check would also 403 the unlock POST.
+- Files: none changed; appended this entry to `HISTORY.md`.
+- Verification: curl reproduction matches the browser console errors exactly ("CORS header 'Access-Control-Allow-Origin' does not match 'https://agent-pay-web.vercel.app/'"). Other console lines (Protobuf Long patching, requiredNamespaces deprecation, file:// security error) are benign wallet/HashPack/WalletConnect warnings, not blockers.
+- External side effects: Read-only HTTPS requests to the deployed frontend and backend. No deployment, database write, inference, or payment occurred.
+- Outcome / next step: Owner must set `WEB_ORIGIN` to `https://agent-pay-web.vercel.app` (no trailing slash) in the Render dashboard and redeploy the backend; set `PROVIDER_ALLOWED_ORIGINS` to the same value for consistency (it is normalized via `new URL(origin).origin`, so its trailing slash was harmless). Then hard-refresh the Vercel page and retry the demo code.
+
+### 20260913T111000Z-root-provider-allowlist-misconfig — Diagnose "No eligible provider" on deployed preview route
+
+- Recorded at: 2026-09-13 11:10:00 UTC (approximate; diagnosis completed ~11:10 UTC)
+- Agent: big-pickle (opencode) primary agent; recorder same.
+- Task: After the origin fix, the deployed frontend login works, but previewing a route returns "No eligible provider is currently available within this budget" (HTTP 422 NO_ELIGIBLE_PROVIDER).
+- Actions: (1) Traced the error to `apps/server/src/routing/prepayment.ts:91` — `selectCheapestEligible` received zero candidates because both providers were pushed to `unavailable` by the catch at line 84. (2) Read `apps/server/src/security/endpoints.ts`: `validateServiceEndpoint` rejects any endpoint whose origin is not in `PROVIDER_ALLOWED_ORIGINS` (line 16). (3) Re-read the README deployment contract: `WEB_ORIGIN` = the Vercel browser origin, but `PROVIDER_ALLOWED_ORIGINS` = the Render service URL ("as soon as Render assigns the service URL, replace it with that exact origin"). (4) Confirmed the deployed provider endpoints are healthy: `/providers/alpha/offer` and `/providers/beta/offer` both return HTTP 200 with valid offers (alpha 1000000 tinybars, beta 2000000 tinybars, both available). (5) Confirmed ENS resolution works: `npm run ens:verify` resolves both `alpha.ocr.agentpayapp.eth` and `beta.ocr.agentpayapp.eth` (ok: true, resolver 0xaA3F591e37433968fa45c1643761a179F05698dA).
+- Root cause: The earlier instruction (entry 20260913T104500Z) told the owner to set both `WEB_ORIGIN` and `PROVIDER_ALLOWED_ORIGINS` to the Vercel URL. That was incorrect for `PROVIDER_ALLOWED_ORIGINS`: it is the allowlist for the provider endpoint origins, which live on the Render service itself (`https://agentpay-api-sbwi.onrender.com`). With only the Vercel origin allowlisted, the backend rejects its own provider endpoints during readiness, both providers become unavailable, and no candidate remains.
+- Files: none changed; appended this entry to `HISTORY.md`.
+- Verification: Provider offers respond 200; ENS records resolve; the only failing boundary is the origin allowlist, matching the code path exactly.
+- External side effects: Read-only HTTPS requests to the deployed backend and the configured Sepolia RPC. No deployment, database write, inference, or payment occurred.
+- Outcome / next step: Owner must set `PROVIDER_ALLOWED_ORIGINS` to `https://agentpay-api-sbwi.onrender.com` in the Render dashboard (keep `WEB_ORIGIN` = `https://agent-pay-web.vercel.app`), redeploy the backend, then retry the preview route.
+
+### 20260913T112500Z-root-third-party-cookie-401-fix — Same-origin API proxy for deployed console
+
+- Recorded at: 2026-09-13 11:25:00 UTC (approximate)
+- Agent: big-pickle (opencode) primary agent; recorder same.
+- Task: The owner's friend (different Hedera account, different browser) can log in but every authenticated call fails: `POST /api/route` and `DELETE /api/session` return 401 UNAUTHENTICATED, while the owner's own browser works.
+- Diagnosis: The session cookie is set by the backend on `agentpay-api-sbwi.onrender.com` while the page runs on `agent-pay-web.vercel.app` — a different registrable domain, so the cookie is third-party. Production cookie flags (`apps/server/src/app.ts:90-95`): `httpOnly`, `secure`, `sameSite: "none"`, 2h TTL. Browsers that block third-party cookies (Safari default, Firefox strict ETP, Chrome with blocking enabled) discard the Set-Cookie from the login response; the login response body still returns `authenticated: true`, so the UI shows the dashboard, but every subsequent request carries no cookie and `sessionClaims` (`app.ts:41-45`) throws 401. The owner's browser allows third-party cookies, which is why it works for them. The friend's Hedera account is irrelevant — sessions are cookie-based, not wallet-based.
+- Fix implemented: same-origin proxy. Added `apps/web/vercel.json` with `rewrites: [{ source: "/api/:path*", destination: "https://agentpay-api-sbwi.onrender.com/api/:path*" }]` so the browser talks only to the Vercel origin and the cookie becomes first-party. No backend change needed: the browser still sends `Origin: https://agent-pay-web.vercel.app` on POST (matches `WEB_ORIGIN`), CORS is moot for same-origin requests, and `PROVIDER_ALLOWED_ORIGINS` stays the Render origin because provider endpoints are called server-side. Updated README deployment section (line ~584) to document the proxy and the reason.
+- Files: added `apps/web/vercel.json`; edited `README.md`; appended this entry to `HISTORY.md`.
+- Verification: `vercel.json` parses as valid JSON; Render backend `/health` returns 200; `NEXT_PUBLIC_API_BASE_URL=https://agent-pay-web.vercel.app npm run build` in `apps/web` succeeds and the new base URL is inlined in the built chunk. No TS code changed, so lint/typecheck are unaffected (build includes typecheck).
+- External side effects: none beyond read-only HTTPS requests. No deployment, database write, inference, or payment.
+- Outcome / next step: Owner must (1) set Vercel env `NEXT_PUBLIC_API_BASE_URL` to `https://agent-pay-web.vercel.app`, (2) redeploy the frontend (vercel.json is picked up automatically), (3) hard-refresh. Immediate workaround for the friend meanwhile: enable third-party cookies for the site or use a browser that allows them (Chrome default).

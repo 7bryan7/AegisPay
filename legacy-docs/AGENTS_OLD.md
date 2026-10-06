@@ -1,4 +1,4 @@
-# AgentPay — instructions for coding agents
+# AgentPay — instructions for coding agents (Old project version)
 
 ## Purpose and current status
 
