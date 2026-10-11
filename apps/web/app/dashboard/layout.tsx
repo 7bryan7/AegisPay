@@ -1,9 +1,10 @@
 import type { ReactNode } from "react";
 import Link from "next/link";
 import "./dashboard.css";
+import "./payables.css";
 
 const navItems = [
-  { href: "/dashboard", label: "Agent Console", icon: "🤖", exact: true },
+  { href: "/dashboard", label: "Treasury workspace", icon: "◈", exact: true },
 ];
 
 export default function DashboardLayout({ children }: Readonly<{ children: ReactNode }>) {
@@ -36,7 +37,7 @@ export default function DashboardLayout({ children }: Readonly<{ children: React
         </Link>
 
         <nav className="dash-nav">
-          <p className="dash-nav-label">ROUTER</p>
+          <p className="dash-nav-label">ACCOUNTS PAYABLE</p>
           {navItems.map((item) => {
             const active = item.exact ? true : false;
             return (
@@ -54,7 +55,7 @@ export default function DashboardLayout({ children }: Readonly<{ children: React
 
         <div className="dash-sidebar-foot">
           <div className="dash-flow-mini">
-            <span>ENS</span>→<span>Readiness</span>→<span>AI</span>→<span>Hedera</span>→<span>x402</span>
+            <span>Invoice</span>→<span>Verify</span>→<span>Decide</span>
           </div>
           <a
             href="https://github.com/hackerjose25/AgentPay.git"

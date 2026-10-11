@@ -3,8 +3,8 @@ import type { ReactNode } from "react";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "AgentPay — Autonomous AI Service Router",
-  description: "Autonomous AI service router — discover the best service, prove why it was chosen, and pay for it autonomously. ENSv2 discovers, readiness verifies, AI decides, Hedera settles, x402 unlocks.",
+  title: "AgentPay Treasury — Accounts Payable",
+  description: "Invoice verification and treasury decisions for an Arc Testnet accounts-payable workflow under development.",
 };
 
 export default function RootLayout({ children }: Readonly<{ children: ReactNode }>) {

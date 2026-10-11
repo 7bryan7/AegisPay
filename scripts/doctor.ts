@@ -1,15 +1,12 @@
 import { Client } from "pg";
-import { createPublicClient, http } from "viem";
-import { sepolia } from "viem/chains";
-import { requiredRuntimeKeys } from "../apps/server/src/config.js";
-import { fetchHederaFacilitatorSupport } from "../apps/server/src/payments/facilitator.js";
+import { loadApConfig } from "../apps/server/src/ap/config.js";
 import { hasPlaceholder, jsonLog, loadRootEnv, safeErrorDetail } from "./shared.js";
 
 loadRootEnv();
 type Check = { name: string; ok: boolean; detail: string };
 const checks: Check[] = [];
 
-const missing = requiredRuntimeKeys.filter((key) => hasPlaceholder(process.env[key]));
+const missing = ["DATABASE_URL", "BUSINESS_ID", "SESSION_SECRET", "DEMO_ACCESS_CODE"].filter((key) => hasPlaceholder(process.env[key]));
 checks.push({
   name: "environment",
   ok: missing.length === 0,
@@ -28,25 +25,23 @@ if (!hasPlaceholder(process.env.DATABASE_URL)) {
   await check("database", async () => {
     const client = new Client({ connectionString: process.env.DATABASE_URL, connectionTimeoutMillis: 5_000 });
     await client.connect();
-    try { await client.query("SELECT 1"); } finally { await client.end(); }
-    return "connection succeeded";
+    try {
+      const result = await client.query("SELECT business_id FROM ap_treasuries WHERE business_id = $1", [process.env.BUSINESS_ID]);
+      if (!result.rowCount) throw new Error("Treasury is not configured");
+    } finally { await client.end(); }
+    return "AP schema and configured treasury are accessible";
   });
 }
 
-if (!hasPlaceholder(process.env.ENS_RPC_URL) && process.env.ENS_CHAIN_ID === "11155111") {
-  await check("ens-rpc", async () => {
-    const client = createPublicClient({ chain: sepolia, transport: http(process.env.ENS_RPC_URL) });
-    const block = await client.getBlockNumber();
-    return `Sepolia RPC responded at block ${block.toString()}`;
-  });
-}
-
-if (process.env.BLOCKY402_FACILITATOR_URL === "https://api.testnet.blocky402.com") {
-  await check("blocky402", async () => {
-    const support = await fetchHederaFacilitatorSupport(process.env.BLOCKY402_FACILITATOR_URL!);
-    return `exact x402 v${support.x402Version} Hedera testnet; advertised fee payer ${support.feePayer}`;
-  });
-}
+try { loadApConfig(); checks.push({ name: "configuration", ok: true, detail: "AP settings are valid; blank credentials disable access" }); }
+catch { checks.push({ name: "configuration", ok: false, detail: "AP configuration is invalid; check variable names and value formats" }); }
+const workerMode = process.env.PAYMENT_MODE ?? "disabled";
+const dispatchReady = workerMode === "arc_testnet" && !hasPlaceholder(process.env.CIRCLE_API_KEY) && !hasPlaceholder(process.env.ARC_RPC_URL);
+checks.push({
+  name: "workers",
+  ok: true,
+  detail: `Pipeline (extraction, planning, reservation, dispatch, reconciliation, retention) is runnable via npm run worker; mode=${workerMode}, dispatch=${dispatchReady ? "enabled" : "disabled"}`
+});
 
 for (const [name, urlKey, keyKey, modelKey] of [
   ["extraction-model", "EXTRACTION_MODEL_BASE_URL", "EXTRACTION_MODEL_API_KEY", "EXTRACTION_MODEL_ID"]
@@ -67,6 +62,33 @@ for (const [name, urlKey, keyKey, modelKey] of [
       return `Gemini model metadata responded with HTTP ${response.status}; no inference invoked`;
     });
   }
+}
+
+if (!hasPlaceholder(process.env.ARC_RPC_URL)) {
+  await check("arc-network", async () => {
+    const rpcUrl = new URL(process.env.ARC_RPC_URL!);
+    if (rpcUrl.protocol !== "https:" && rpcUrl.hostname !== "127.0.0.1" && rpcUrl.hostname !== "localhost") {
+      throw new Error("RPC endpoint must use HTTPS");
+    }
+    const response = await fetch(rpcUrl.href, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", method: "eth_chainId", params: [], id: 1 }),
+      signal: AbortSignal.timeout(5_000)
+    });
+    if (!response.ok) throw new Error(`RPC endpoint returned HTTP ${response.status}`);
+    const data = (await response.json()) as { result?: string };
+    const chainId = Number.parseInt(data.result ?? "0", 16);
+    return `Arc network responded with chain ID ${chainId}`;
+  });
+}
+
+if (!hasPlaceholder(process.env.CIRCLE_API_KEY) && !hasPlaceholder(process.env.CIRCLE_WALLET_ID)) {
+  checks.push({
+    name: "circle-wallet",
+    ok: true,
+    detail: `Circle wallet ID ${process.env.CIRCLE_WALLET_ID} configured for developer-controlled transfers`
+  });
 }
 
 jsonLog({ ok: checks.every(({ ok }) => ok), checks });

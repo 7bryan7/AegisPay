@@ -2,7 +2,7 @@
 
 ## Current authorization and document roles
 
-**Current phase: planning only, as of 6 October 2026.** The user requested exactly `README.MD`, `AGENTS.MD`, and `HISTORY.MD`. Do not import the application into this workspace, install dependencies, change source code, run migrations, provision wallets, transfer funds, deploy, or submit the project under that planning request.
+**Current phase: implementation, authorized 8 October 2026.** The user explicitly instructed: “Begin implementation and install the required dependencies.” The previous 6 October request covered only `README.MD`, `AGENTS.MD`, and `HISTORY.MD`; that planning-only boundary has ended. Proceed with the scoped build, preserving the financial, verification and repository rules below. Live operations still require the intended configured development/testnet scope; publication and submission are not implied by dependency installation.
 
 When the user later authorizes implementation, proceed with the scoped build in `README.MD`; that instruction ends the planning-only boundary. Do not repeatedly seek confirmation for routine, reversible work already within the user's authorization. Respect actual tool permission requirements and distinguish them from project preferences.
 

@@ -5,8 +5,10 @@ coverage/
 playwright-report/
 test-results/
 .env
+.local/
 .env.*
 !.env.example
+!.env.payables.example
 !.env.ens-setup.example
 *.log
 *.tsbuildinfo

@@ -1,0 +1,33 @@
+{
+  "kind": "fixture",
+  "businessId": "local-business",
+  "reason": "Synthetic development example; no real vendor verification or wallet ownership is claimed.",
+  "treasury": {
+    "walletId": "synthetic-wallet-not-a-circle-wallet",
+    "walletAddress": "0x1111111111111111111111111111111111111111",
+    "chainId": 5042002,
+    "tokenAddress": "0x3600000000000000000000000000000000000000",
+    "paymentMode": "fixture",
+    "policy": {
+      "autoPayMaxMicroUsdc": "2000000",
+      "hardTxMaxMicroUsdc": "5000000",
+      "dailyBudgetMicroUsdc": "10000000",
+      "categoryBudgetMicroUsdc": "8000000",
+      "minReserveMicroUsdc": "5000000"
+    }
+  },
+  "vendors": [{
+    "businessId": "local-business", "id": "vendor", "name": "Synthetic vendor", "aliases": [],
+    "status": "APPROVED", "address": "0x2222222222222222222222222222222222222222",
+    "addressVersion": 1, "chainId": 5042002, "category": "office", "settlementCurrency": "USD",
+    "settlementAgreementReference": "synthetic-agreement", "verificationReference": "synthetic-owner-check",
+    "verifiedAt": "2026-10-09T00:00:00.000Z"
+  }],
+  "purchaseOrders": [{
+    "businessId": "local-business", "id": "po", "vendorId": "vendor", "version": 1,
+    "amountMicroUsdc": "1500000", "outstandingMicroUsdc": "1500000",
+    "deliveryAccepted": true, "acceptanceReference": "synthetic-acceptance",
+    "description": "Synthetic service for development tests only", "dueDate": "2026-10-09",
+    "activeObligationId": null
+  }]
+}

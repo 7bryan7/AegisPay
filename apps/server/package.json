@@ -13,6 +13,7 @@
   "dependencies": {
     "@agentpay/core": "*",
     "@ai-sdk/google": "4.0.67",
+    "@circle-fin/developer-controlled-wallets": "10.8.1",
     "@x402/core": "2.25.0",
     "@x402/express": "2.25.0",
     "@x402/fetch": "2.25.0",
