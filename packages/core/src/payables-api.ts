@@ -25,10 +25,10 @@ export const invoiceDetailSchema = z.strictObject({
 });
 export const auditSchema = z.strictObject({ events: z.array(z.strictObject({
   key: z.string(), type: z.string(), version: z.number().int(), createdAt: z.iso.datetime()
-})) });
+})), decision: invoiceDetailSchema.shape.decision.optional(), payment: invoiceDetailSchema.shape.payment.optional() });
 export const treasuryViewSchema = z.strictObject({
   network: z.literal("Arc Testnet"), configuredMode: z.enum(["disabled", "fixture", "arc_testnet"]),
-  dispatchEnabled: z.literal(false), screening: z.literal("local_registry"),
+  dispatchEnabled: z.boolean(), screening: z.literal("local_registry"),
   walletAddress: z.string().nullable(), paused: z.boolean(),
   cashMicroUsdc: microUsdcStringSchema.nullable(), holdsMicroUsdc: microUsdcStringSchema.nullable(),
   minimumReserveMicroUsdc: microUsdcStringSchema.nullable(),

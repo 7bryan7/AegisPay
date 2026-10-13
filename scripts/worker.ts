@@ -1,4 +1,4 @@
-import { createCircleAdapterFromEnvironment, dispatchNextPayment } from "../apps/server/src/payments/dispatch.js";
+import { createCircleAdapterFromEnvironment, dispatchNextPayment, recoverSubmittingPayments } from "../apps/server/src/payments/dispatch.js";
 import { createArcReconciliationFromEnvironment, reconcileNextPayment } from "../apps/server/src/payments/reconcile.js";
 import { setTimeout } from "node:timers/promises";
 import { Pool } from "pg";
@@ -13,47 +13,52 @@ import { jsonLog, loadRootEnv } from "./shared.js";
 loadRootEnv();
 const config = loadApConfig();
 if (!config.DATABASE_URL) throw new Error("Worker requires the configured development DATABASE_URL and AP migrations");
-const pool = new Pool({ connectionString: config.DATABASE_URL, max: 3, connectionTimeoutMillis: 5000,
-  statement_timeout: 10000 });
+const pool = new Pool({ connectionString: config.DATABASE_URL, max: 3, connectionTimeoutMillis: 5000, statement_timeout: 10000 });
 let extractor: PayableExtractor | null = null;
-// Fixture mode never falls through to a real model, even with credentials present.
 if (config.PAYMENT_MODE !== "fixture") {
-  try { extractor = createPayableExtractor(process.env); } catch { /* Missing/invalid model setup holds invoices. */ }
+  try { extractor = createPayableExtractor(process.env); } catch { /* Missing model setup holds invoices. */ }
 }
-const stop = new AbortController();
-const planning = createWorkerPlanning(process.env);
+const stop = new AbortController(), planning = createWorkerPlanning(process.env);
 const circle = config.PAYMENT_MODE === "arc_testnet" ? createCircleAdapterFromEnvironment(process.env) : null;
 const reconciliation = circle ? createArcReconciliationFromEnvironment(process.env) : null;
-process.once("SIGINT", () => stop.abort());
-process.once("SIGTERM", () => stop.abort());
-jsonLog({ worker: "extraction-planning-and-retention", extractionAvailable: extractor !== null, planningAvailable: planning !== null,
-  dispatchAvailable: circle !== null, dispatchEnabled: false, mode: config.PAYMENT_MODE });
+const dispatchEnabled = circle?.dispatchEnabled === true && planning !== null;
+async function heartbeat(healthy:boolean) {
+  await pool.query(`INSERT INTO ap_worker_status (business_id,extraction_available,payment_available,dispatch_enabled,healthy)
+    VALUES ($1,$2,$3,$4,$5) ON CONFLICT (business_id) DO UPDATE SET updated_at=now(),extraction_available=$2,
+    payment_available=$3,dispatch_enabled=$4,healthy=$5`,
+    [config.BUSINESS_ID,extractor!==null,circle!==null && reconciliation!==null && planning!==null,dispatchEnabled,healthy]);
+}
+process.once("SIGINT", () => stop.abort()); process.once("SIGTERM", () => stop.abort());
+jsonLog({ worker: "payables", extractionAvailable: extractor !== null, planningAvailable: planning !== null, dispatchEnabled, mode: config.PAYMENT_MODE });
+async function reserve() {
+  if (!dispatchEnabled || !planning) return;
+  const result = await reserveNextPayment(pool,config.BUSINESS_ID,new Date(),planning);
+  if (result.status === "RESERVED") jsonLog({worker:"payment-reservation",status:result.status,intentId:result.intentId});
+}
 try {
   while (!stop.signal.aborted) {
     try {
-      // Bounded batch, no overlapping model calls. Payment heartbeat remains unset.
-      for (let count = 0; count < 10 && !stop.signal.aborted; count++) {
-        if (!await processNextObligation(pool, config.BUSINESS_ID, extractor, planning)) break;
+      await recoverSubmittingPayments(pool,config.BUSINESS_ID);
+      // Reconciliation runs even when paused or new dispatch is disabled.
+      if (circle && reconciliation) {
+        const result=await reconcileNextPayment(pool,circle,reconciliation.cashReader,reconciliation.receiptReader,config.BUSINESS_ID);
+        if (result.status!=="NO_UNRESOLVED") jsonLog({worker:"payment-reconciliation",...result});
       }
-      if (planning) {
-        for (let count = 0; count < 10 && !stop.signal.aborted; count++) {
-          const reservation = await reserveNextPayment(pool, config.BUSINESS_ID);
-          if (reservation.status !== "RESERVED") break;
-          jsonLog({ worker: "payment-reservation", status: reservation.status, intentId: reservation.intentId, dispatchEnabled: false });
-        }
+      await reserve(); // Preserve exact approvals before re-evaluating other obligations.
+      for (let count=0;count<10 && !stop.signal.aborted;count++) {
+        if (!await processNextObligation(pool,config.BUSINESS_ID,extractor,planning)) break;
+        await reserve();
       }
-      if (circle) {
-              if (circle && reconciliation) {
-                const settled = await reconcileNextPayment(pool, circle, reconciliation.cashReader, reconciliation.receiptReader, config.BUSINESS_ID);
-                if (settled.status !== "NO_UNRESOLVED") jsonLog({ worker: "payment-reconciliation", status: settled.status,
-                  intentId: settled.intentId, dispatchEnabled: false });
-              }
-        const dispatch = await dispatchNextPayment(pool, circle, config.BUSINESS_ID);
-        if (dispatch.status !== "NO_RESERVED") jsonLog({ worker: "payment-dispatch", status: dispatch.status,
-          intentId: dispatch.intentId, dispatchEnabled: false });
+      if (circle && planning) {
+        const result=await dispatchNextPayment(pool,circle,config.BUSINESS_ID,planning);
+        if (result.status!=="NO_RESERVED" && result.status!=="DISABLED") jsonLog({worker:"payment-dispatch",...result});
       }
-      await cleanupExpiredInputs(pool, config.BUSINESS_ID);
-    } catch { jsonLog({ worker: "extraction-planning-and-retention", error: "PROCESSING_UNAVAILABLE", dispatchEnabled: false }); }
-    try { await setTimeout(30_000, undefined, { signal: stop.signal }); } catch { /* Shutdown. */ }
+      await cleanupExpiredInputs(pool,config.BUSINESS_ID);
+      await heartbeat(true);
+    } catch {
+      await heartbeat(false).catch(()=>undefined);
+      jsonLog({worker:"payables",error:"PROCESSING_UNAVAILABLE",dispatchEnabled});
+    }
+    try { await setTimeout(30000,undefined,{signal:stop.signal}); } catch { /* Shutdown. */ }
   }
-} finally { await pool.end(); }
+} finally { await heartbeat(false).catch(()=>undefined); await pool.end(); }

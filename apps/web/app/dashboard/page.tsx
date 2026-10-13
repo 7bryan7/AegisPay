@@ -42,7 +42,7 @@ export default function DashboardPage() {
         return;
       }
       const [invoices, funds] = await Promise.all([api.list(), api.treasury()]);
-      if (active) { setList(invoices); setTreasury(funds); setMessage("Workspace loaded. Payments are unavailable."); }
+      if (active) { setList(invoices); setTreasury(funds); setMessage("Workspace loaded."); }
     }).catch((error: unknown) => {
       if (active) setMessage(error instanceof PayablesApiError ? error.message : "Backend unavailable. Start the API and check its configuration.");
     });
@@ -118,7 +118,10 @@ export default function DashboardPage() {
       {!operator && <p className="ap-notice">Reviewer access is isolated from private data. Sanitized examples have not been added yet.</p>}
       <section className="ap-panel" id="treasury"><h2>Treasury</h2><div className="ap-metrics"><div><span>USDC balance</span><strong>{money(treasury?.cashMicroUsdc)}</strong></div><div><span>Payment holds + fee allowances</span><strong>{money(treasury?.holdsMicroUsdc)}</strong></div><div><span>Minimum reserve</span><strong>{money(treasury?.minimumReserveMicroUsdc)}</strong></div></div>
         <p className="ap-wrap">{treasury?.walletAddress ? `Treasury wallet: ${treasury.walletAddress}` : "Treasury wallet unavailable"}</p><p>{treasury?.message ?? "Treasury storage has not loaded. No balance is assumed."}</p>
-        {treasury && <p>Configured mode: {treasury.configuredMode} · New submissions: disabled</p>}</section>
+        {treasury && <p>Configured mode: {treasury.configuredMode} · New submissions: {treasury.dispatchEnabled ? "configured" : "disabled"} · Treasury: {treasury.paused ? "paused" : "active"}</p>}
+        {operator && treasury && <button disabled={busy} onClick={() => void action(async () => {
+          await api.setPaused(!treasury.paused); await refresh(offset); setMessage("Treasury setting saved. Reconciliation continues for existing payments.");
+        })}>{treasury.paused ? "Resume treasury" : "Pause treasury"}</button>}</section>
       {operator && <section className="ap-panel"><h2>Upload invoice</h2><p>One PNG or JPEG, up to 5 MB. The vendor and amount must be independently verified before payment.</p><form onSubmit={upload} className="ap-upload">
         <label htmlFor="invoice-file">Invoice image<input ref={selection} id="invoice-file" type="file" accept="image/png,image/jpeg" disabled={busy} required onChange={(event) => { setFile(event.target.files?.[0] ?? null); uploadKey.current = null; }} /></label>
         <label htmlFor="po-hint">Purchase order reference (optional)<input id="po-hint" value={hint} maxLength={500} disabled={busy} onChange={(event) => { setHint(event.target.value); uploadKey.current = null; }} /></label>
@@ -140,12 +143,12 @@ export default function DashboardPage() {
             <button disabled={busy} type="submit">Approve invoice</button>
           </form>
         )}
-        <h3>Payment</h3><p>{paymentMessage(detail.payment?.state)}</p>{detail.payment?.providerId && <p className="ap-wrap">Circle ID: {detail.payment.providerId}{detail.payment.providerState ? ` · ${readable(detail.payment.providerState)}` : ""}</p>}
+        <h3>Payment</h3><p>{treasury?.configuredMode === "fixture" && detail.payment?.state === "SETTLED" ? "Synthetic settlement fixture. No real transfer occurred." : paymentMessage(detail.payment?.state)}</p>{detail.payment?.providerId && <p className="ap-wrap">Circle ID: {detail.payment.providerId}{detail.payment.providerState ? ` · ${readable(detail.payment.providerState)}` : ""}</p>}
         {detail.payment?.transactionHash && <p className="ap-wrap">Transaction reference (not proof of settlement): {detail.payment.transactionHash}</p>}
         {detail.payment?.settledAt && <p>Settled at: {new Date(detail.payment.settledAt).toLocaleString()}</p>}
         {detail.payment?.actualFeeMicroUsdc && <p>Verified network fee: {money(detail.payment.actualFeeMicroUsdc)}</p>}
         {detail.payment?.verificationReference && <p className="ap-wrap">Arc verification: {detail.payment.verificationReference}</p>}
-        <h3>Activity</h3><p>Recent events (up to 500). Export contains event metadata only.</p><ol className="ap-activity">{audit?.events.map((event) => <li key={event.key}><strong>{readable(event.type)}</strong><time>{new Date(event.createdAt).toLocaleString()}</time></li>)}</ol>
+        <h3>Activity</h3><p>Recent events (up to 500). Export includes the decision and payment evidence references.</p><ol className="ap-activity">{audit?.events.map((event) => <li key={event.key}><strong>{readable(event.type)}</strong><time>{new Date(event.createdAt).toLocaleString()}</time></li>)}</ol>
         <button onClick={exportAudit} disabled={!audit}>Export activity</button></section>}
     </>}
   </div>;

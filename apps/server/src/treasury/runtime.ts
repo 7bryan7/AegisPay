@@ -3,6 +3,7 @@ import { ARC_CHAIN_ID, ARC_USDC_ADDRESS, feeEvidenceSchema } from "@agentpay/cor
 import { createGeminiPayablePlanner } from "../agent/planner.js";
 import { arcReaderConfigSchema, createArcCashReader } from "../payments/arc.js";
 import { createArcFeeReader } from "../payments/arc-fees.js";
+import { createArcReceiptReader } from "../payments/arc-receipt.js";
 import type { PlanningAdapters } from "./prepare.js";
 
 /** Construction performs no network calls. Fixture/disabled modes cannot construct live readers. */
@@ -20,6 +21,18 @@ export function createWorkerPlanning(environment: NodeJS.ProcessEnv): PlanningAd
     let planner = null;
     try { planner = createGeminiPayablePlanner(environment); } catch { /* Valid evidence can still produce deterministic holds/approval requests. */ }
     return { mode: "arc_testnet", planner,
+      async verifyPayments(cash, payments) {
+        const reader = createArcReceiptReader(readerConfig(cash.walletAddress));
+        const verified = [];
+        for (const payment of payments) {
+          if (!payment.transactionHash) { verified.push(payment); continue; }
+          const receipt = await reader.verify({ cash, transactionHash: payment.transactionHash,
+            recipient: payment.recipient, amountMicroUsdc: payment.amountMicroUsdc });
+          verified.push({ ...payment, receipt, terminalEvidenceReference: payment.state === "FAILED" && receipt.outcome === "REVERTED"
+            ? receipt.verificationReference : payment.terminalEvidenceReference });
+        }
+        return verified;
+      },
       readCash: (treasury) => {
         if (treasury.walletId !== config.CIRCLE_WALLET_ID || treasury.mode !== "arc_testnet") throw new Error("PLANNING_WALLET_MISMATCH");
         return createArcCashReader(readerConfig(treasury.walletAddress)).read();

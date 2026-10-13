@@ -1,6 +1,7 @@
 'use client';
 
 import { useEffect, useRef, useState } from 'react';
+import Link from 'next/link';
 import { QRCodeSVG } from 'qrcode.react';
 import { getWalletAccountId, subscribeWalletAccount } from '../lib/wallet-store';
 
@@ -81,6 +82,7 @@ export default function Navbar() {
 
       <div className="nav-actions">
         <div className="open-contact">
+          <Link href="/dashboard" style={{ marginRight: '1.25rem', color: '#ceff45', textDecoration: 'none', fontWeight: 600, fontSize: '0.95rem' }}>Dashboard</Link>
           <a href="https://github.com/hackerjose25/AgentPay.git" target="_blank" rel="noopener noreferrer">GitHub</a>
         </div>
 

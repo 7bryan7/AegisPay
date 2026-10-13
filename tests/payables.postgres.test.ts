@@ -13,7 +13,7 @@ import { syntheticPlanning } from "./support/planning.js";
 import { readPlanningState } from "../apps/server/src/treasury/ledger.js";
 import { preparePlanning } from "../apps/server/src/treasury/prepare.js";
 import { reserveNextPayment } from "../apps/server/src/payments/worker.js";
-import { dispatchNextPayment } from "../apps/server/src/payments/dispatch.js";
+import { dispatchNextPayment, recoverSubmittingPayments } from "../apps/server/src/payments/dispatch.js";
 import { reconcileNextPayment } from "../apps/server/src/payments/reconcile.js";
 import { isExactApprovalValid, payableApprovalSchema } from "@agentpay/core";
 
@@ -59,6 +59,17 @@ async function intent(business: string, id: string, decisionId: string) {
   return paymentId;
 }
 
+async function plannedPayment(approval = false) {
+  const businessId=randomUUID(), manifest=syntheticEnrollment(businessId);
+  await enrollPayables(pool,{businessId,actorId:"synthetic-owner",role:"OPERATOR",paymentMode:"fixture"},manifest);
+  await pool.query(`UPDATE ap_treasuries SET paused=false,policy=jsonb_set(policy,'{autoPayMaxMicroUsdc}',$2::jsonb) WHERE business_id=$1`,
+    [businessId,JSON.stringify(approval?"1000000":"2000000")]);
+  const saved=await upload(businessId);
+  await processNextObligation(pool,businessId,{modelId:"synthetic",extract:()=>Promise.resolve(syntheticPayable())},syntheticPlanning());
+  const decision=(await pool.query<{id:string}>("SELECT id FROM ap_decisions WHERE business_id=$1 AND obligation_id=$2",[businessId,saved.obligationId])).rows[0]!;
+  return {businessId,manifest,obligationId:saved.obligationId,decisionId:decision.id};
+}
+
 beforeAll(async () => {
   await admin.query(`CREATE SCHEMA ${schema}`);
   schemaCreated = true;
@@ -67,6 +78,7 @@ beforeAll(async () => {
   }
   await pool.query("INSERT INTO providers (ens_name) VALUES ('legacy.example.eth')");
   await pool.query(await readFile(new URL("../migrations/004_payables.sql", import.meta.url), "utf8"));
+  await pool.query(await readFile(new URL("../migrations/005_worker_status.sql", import.meta.url), "utf8"));
 });
 afterAll(async () => {
   await pool.end();
@@ -328,11 +340,11 @@ describe("AP PostgreSQL persistence", () => {
         provider_idempotency_key::text AS provider_key FROM ap_payment_intents WHERE business_id = $1 AND id = $2`,
       [businessId, result.intentId])).rows[0]).toMatchObject({ state: "RESERVED", amount: "1500000", fee: request.feeAllowanceMicroUsdc, provider_key: result.providerIdempotencyKey });
     expect((await pool.query<{ status: string }>("SELECT status FROM ap_reservations WHERE business_id = $1 AND intent_id = $2", [businessId, result.intentId])).rows[0]?.status).toBe("HELD");
-    const dispatched = await dispatchNextPayment(pool, { submit: (request) => {
+    const dispatched = await dispatchNextPayment(pool, { dispatchEnabled: true, submit: (request) => {
       expect(request).toMatchObject({ walletId: manifest.treasury.walletId, recipient: manifest.vendors[0]!.address,
         amountMicroUsdc: "1500000", providerIdempotencyKey: result.providerIdempotencyKey });
       return Promise.resolve({ providerId: "00000000-0000-4000-8000-000000000099", providerState: "INITIATED" });
-    } }, businessId);
+    } }, businessId, syntheticPlanning());
     expect(dispatched).toMatchObject({ status: "PENDING", intentId: result.intentId, providerId: "00000000-0000-4000-8000-000000000099" });
     expect((await pool.query<{ state: string; provider_id: string; provider_state: string }>("SELECT state, provider_id, provider_state FROM ap_payment_intents WHERE business_id = $1 AND id = $2", [businessId, result.intentId])).rows[0]).toMatchObject({ state: "PENDING", provider_id: "00000000-0000-4000-8000-000000000099", provider_state: "INITIATED" });
     const settlementHash = `0x${"b".repeat(64)}`;
@@ -342,7 +354,9 @@ describe("AP PostgreSQL persistence", () => {
         walletAddress: manifest.treasury.walletAddress, cashMicroUsdc: "20000000", blockNumber: "100", blockHash: `0x${"a".repeat(64)}`,
         blockTimestamp: new Date().toISOString(), capturedAt: new Date().toISOString(), observedAt: new Date().toISOString() }) },
       { verify: (request) => { expect(request).toMatchObject({ transactionHash: settlementHash, recipient: manifest.vendors[0]!.address, amountMicroUsdc: "1500000" });
-        return Promise.resolve({ transactionHash: settlementHash, amountMicroUsdc: "1500000", actualFeeMicroUsdc: "21", outcome: "SUCCESS", verificationReference: "arc-test-receipt" }); } }, businessId);
+        return Promise.resolve({ chainId:5042002,tokenAddress:"0x3600000000000000000000000000000000000000",walletAddress:manifest.treasury.walletAddress,
+          recipient:manifest.vendors[0]!.address,blockNumber:"99",blockHash:`0x${"c".repeat(64)}`,cashBlockHash:`0x${"a".repeat(64)}`,
+          transactionHash: settlementHash, amountMicroUsdc: "1500000", actualFeeMicroUsdc: "21", outcome: "SUCCESS", verificationReference: "arc-test-receipt" }); } }, businessId);
     expect(settled).toMatchObject({ status: "SETTLED", intentId: result.intentId, transactionHash: settlementHash });
     expect((await pool.query<{ state: string; transaction_hash: string; actual_fee: string }>("SELECT state, transaction_hash, actual_fee_micro_usdc::text AS actual_fee FROM ap_payment_intents WHERE business_id = $1 AND id = $2", [businessId, result.intentId])).rows[0]).toMatchObject({ state: "SETTLED", transaction_hash: settlementHash, actual_fee: "21" });
     expect((await pool.query<{ status: string }>("SELECT status FROM ap_reservations WHERE business_id = $1 AND intent_id = $2", [businessId, result.intentId])).rows[0]?.status).toBe("CONSUMED");
@@ -414,5 +428,130 @@ describe("AP PostgreSQL persistence", () => {
     expect(await cleanupExpiredInputs(pool, business)).toBe(0);
     expect((await pool.query<{ n: number }>("SELECT count(*)::int AS n FROM ap_events WHERE business_id = $1 AND event_type = 'INPUT_REMOVED'", [business])).rows[0]?.n).toBe(1);
     expect((await pool.query("SELECT input_sha256 FROM ap_obligations WHERE business_id = $1", [business])).rowCount).toBe(1);
+  });
+});
+
+// Isolated real PostgreSQL checks of competing workers and fail-closed dispatch.
+describe("payment recovery and authorization", () => {
+  it("serializes competing reservations and competing dispatchers", async () => {
+    const p=await plannedPayment();
+    const reserved=await Promise.all([reserveNextPayment(pool,p.businessId,new Date(),syntheticPlanning()),reserveNextPayment(pool,p.businessId,new Date(),syntheticPlanning())]);
+    expect(reserved.filter(r=>r.status==="RESERVED")).toHaveLength(1);
+    let submissions=0;
+    const adapter={dispatchEnabled:true,submit:()=>{submissions++;return Promise.resolve({providerId:randomUUID(),providerState:"INITIATED"});}};
+    await Promise.all([dispatchNextPayment(pool,adapter,p.businessId,syntheticPlanning()),dispatchNextPayment(pool,adapter,p.businessId,syntheticPlanning())]);
+    expect(submissions).toBe(1);
+    expect((await pool.query("SELECT 1 FROM ap_reservations WHERE business_id=$1 AND status='HELD'",[p.businessId])).rowCount).toBe(1);
+  });
+  it.each(["pause","vendor","policy","purchase-order","cash","fee"])("does not submit after %s changes",async(change)=>{
+    const p=await plannedPayment();
+    expect((await reserveNextPayment(pool,p.businessId,new Date(),syntheticPlanning())).status).toBe("RESERVED");
+    if(change==="pause") await pool.query("UPDATE ap_treasuries SET paused=true WHERE business_id=$1",[p.businessId]);
+    if(change==="vendor") await pool.query("UPDATE ap_vendors SET address_version=address_version+1 WHERE business_id=$1",[p.businessId]);
+    if(change==="policy") await pool.query("UPDATE ap_treasuries SET policy_version=policy_version+1 WHERE business_id=$1",[p.businessId]);
+    if(change==="purchase-order") await pool.query("UPDATE ap_purchase_orders SET version=version+1 WHERE business_id=$1",[p.businessId]);
+    const readers=syntheticPlanning(), originalCash=readers.readCash.bind(readers), originalFee=readers.estimateFee.bind(readers);
+    if(change==="cash") readers.readCash=async t=>({...await originalCash(t),cashMicroUsdc:"1"});
+    if(change==="fee") readers.estimateFee=async(c,r,a)=>({...await originalFee(c,r,a),maxFeePerGasNative:"2000000000"});
+    let submissions=0;
+    const result=await dispatchNextPayment(pool,{dispatchEnabled:true,submit:()=>{submissions++;throw new Error("must not submit");}},p.businessId,readers);
+    expect(result.status).toBe("CANCELLED");expect(submissions).toBe(0);
+    expect((await pool.query("SELECT 1 FROM ap_reservations WHERE business_id=$1 AND status='RELEASED'",[p.businessId])).rowCount).toBe(1);
+  });
+  it("retains an uncertain submission across restart without replay",async()=>{
+    const p=await plannedPayment();
+    await reserveNextPayment(pool,p.businessId,new Date(),syntheticPlanning());
+    let submissions=0;
+    const adapter={dispatchEnabled:true,submit:()=>{submissions++;throw new Error("timeout after acceptance");}};
+    expect((await dispatchNextPayment(pool,adapter,p.businessId,syntheticPlanning())).status).toBe("UNKNOWN");
+    await recoverSubmittingPayments(pool,p.businessId);
+    expect((await dispatchNextPayment(pool,adapter,p.businessId,syntheticPlanning())).status).toBe("NO_RESERVED");
+    expect((await reserveNextPayment(pool,p.businessId,new Date(),syntheticPlanning())).status).toBe("NO_DUE");
+    expect(submissions).toBe(1);
+    expect((await pool.query("SELECT 1 FROM ap_reservations WHERE business_id=$1 AND status='HELD'",[p.businessId])).rowCount).toBe(1);
+  });
+  it("recovers an expired submission lease to UNKNOWN with its original key and hold",async()=>{
+    const p=await plannedPayment();
+    const r=await reserveNextPayment(pool,p.businessId,new Date(),syntheticPlanning());
+    if(r.status!=="RESERVED") throw new Error("reservation failed");
+    await pool.query("UPDATE ap_payment_intents SET state='SUBMITTING',submitted_at=now(),lease_owner='synthetic-worker',lease_expires_at=now()-interval '1 second' WHERE business_id=$1",[p.businessId]);
+    expect(await recoverSubmittingPayments(pool,p.businessId)).toBe(1);
+    expect(await recoverSubmittingPayments(pool,p.businessId)).toBe(0);
+    expect((await pool.query("SELECT state,provider_idempotency_key::text AS key FROM ap_payment_intents WHERE business_id=$1",[p.businessId])).rows[0])
+      .toEqual({state:"UNKNOWN",key:r.providerIdempotencyKey});
+    expect((await pool.query<{status:string}>("SELECT status FROM ap_reservations WHERE business_id=$1",[p.businessId])).rows[0]?.status).toBe("HELD");
+  });
+  it("preserves an exact approval on the processing queue and still enforces hard limits",async()=>{
+    const p=await plannedPayment(true);
+    await createApStore(pool,168).approve(p.businessId,"owner",p.obligationId,p.decisionId,"Reviewed");
+    expect(await claimExtraction(pool,p.businessId)).toBeNull();
+    const readers=syntheticPlanning(), cash=readers.readCash.bind(readers);
+    readers.readCash=async t=>({...await cash(t),cashMicroUsdc:"1"});
+    expect((await reserveNextPayment(pool,p.businessId,new Date(),readers)).status).toBe("SKIPPED");
+    expect((await pool.query("SELECT 1 FROM ap_payment_intents WHERE business_id=$1",[p.businessId])).rowCount).toBe(0);
+  });
+  it("rejects approval of a stale vendor version",async()=>{
+    const p=await plannedPayment(true);
+    await pool.query("UPDATE ap_vendors SET address_version=address_version+1 WHERE business_id=$1",[p.businessId]);
+    await expect(createApStore(pool,168).approve(p.businessId,"owner",p.obligationId,p.decisionId,"Reviewed"))
+      .rejects.toMatchObject({code:"APPROVAL_NOT_ELIGIBLE"});
+  });
+});
+
+
+describe("atomic terminal evidence",()=>{
+  async function pending() {
+    const p=await plannedPayment();
+    await reserveNextPayment(pool,p.businessId,new Date(),syntheticPlanning());
+    const providerId=randomUUID();
+    await dispatchNextPayment(pool,{dispatchEnabled:true,submit:()=>Promise.resolve({providerId,providerState:"INITIATED"})},p.businessId,syntheticPlanning());
+    const cash=await syntheticPlanning().readCash((await readPlanningState(pool,p.businessId)).treasury);
+    const receipt={chainId:5042002,tokenAddress:"0x3600000000000000000000000000000000000000",walletAddress:p.manifest.treasury.walletAddress,
+      recipient:p.manifest.vendors[0]!.address,blockNumber:"99",blockHash:`0x${"c".repeat(64)}`,cashBlockHash:cash.blockHash,
+      transactionHash:`0x${randomUUID().replaceAll("-", "").repeat(2)}`,amountMicroUsdc:"1500000",actualFeeMicroUsdc:"21",actualFeeNative:"21000000000000",outcome:"SUCCESS",verificationReference:"synthetic-independent-receipt"};
+    const reconcile=(state="COMPLETE")=>reconcileNextPayment(pool,{getStatus:()=>Promise.resolve({providerId,providerState:state,transactionHash:receipt.transactionHash,errorReason:null})},
+      {read:()=>Promise.resolve(cash)},{verify:()=>Promise.resolve(receipt)},p.businessId);
+    return {...p,reconcile,receipt};
+  }
+  it("rolls back every settlement change on a PO conflict, then completes exactly once",async()=>{
+    const p=await pending();
+    await pool.query("UPDATE ap_purchase_orders SET outstanding_micro_usdc=1 WHERE business_id=$1",[p.businessId]);
+    expect((await p.reconcile()).status).toBe("WAITING");
+    expect((await pool.query<{state:string}>("SELECT state FROM ap_payment_intents WHERE business_id=$1",[p.businessId])).rows[0]?.state).toBe("PENDING");
+    expect((await pool.query<{status:string}>("SELECT status FROM ap_reservations WHERE business_id=$1",[p.businessId])).rows[0]?.status).toBe("HELD");
+    await pool.query("UPDATE ap_purchase_orders SET outstanding_micro_usdc=1500000 WHERE business_id=$1",[p.businessId]);
+    const results=await Promise.all([p.reconcile(),p.reconcile()]);
+    expect(results.filter(r=>r.status==="SETTLED"),JSON.stringify(results)).toHaveLength(1);
+    expect((await pool.query("SELECT 1 FROM ap_events WHERE business_id=$1 AND entity_id=$2 AND event_type='PAYMENT_SETTLED'",[p.businessId,p.obligationId])).rowCount).toBe(1);
+    expect((await p.reconcile()).status).toBe("NO_UNRESOLVED");
+  });
+  it("refuses a receipt bound to another recipient",async()=>{
+    const p=await pending();p.receipt.recipient=`0x${"9".repeat(40)}`;
+    expect(await p.reconcile()).toMatchObject({status:"WAITING",reason:"ARC_RECEIPT_TERMS_MISMATCH"});
+    expect((await pool.query<{status:string}>("SELECT status FROM ap_reservations WHERE business_id=$1",[p.businessId])).rows[0]?.status).toBe("HELD");
+  });
+  it("releases a failed payment only after an independently verified reverted receipt and records gas",async()=>{
+    const p=await pending();
+    expect((await p.reconcile("FAILED")).status).toBe("WAITING"); // SUCCESS cannot prove failure.
+    p.receipt.outcome="REVERTED";p.receipt.amountMicroUsdc="0";
+    expect(await p.reconcile("FAILED")).toMatchObject({status:"FAILED"});
+    expect((await pool.query<{status:string}>("SELECT status FROM ap_reservations WHERE business_id=$1",[p.businessId])).rows[0]?.status).toBe("RELEASED");
+    expect((await pool.query<{fee:string}>("SELECT actual_fee_micro_usdc::text AS fee FROM ap_payment_intents WHERE business_id=$1",[p.businessId])).rows[0]?.fee).toBe("21");
+    expect((await pool.query<{outstanding:string}>("SELECT outstanding_micro_usdc::text AS outstanding FROM ap_purchase_orders WHERE business_id=$1",[p.businessId])).rows[0]?.outstanding).toBe("1500000");
+  });
+});
+
+
+
+describe("worker heartbeat",()=>{
+  it("expires old heartbeats and reports unavailable after a failed loop",async()=>{
+    const p=await plannedPayment(),store=createApStore(pool,168);
+    expect(await store.workerStatus(p.businessId)).toBeNull();
+    await pool.query("INSERT INTO ap_worker_status (business_id,extraction_available,payment_available,dispatch_enabled,healthy) VALUES ($1,true,true,true,true)",[p.businessId]);
+    expect(await store.workerStatus(p.businessId)).toEqual({extractionAvailable:true,paymentAvailable:true,dispatchEnabled:true});
+    await pool.query("UPDATE ap_worker_status SET updated_at=now()-interval '2 minutes' WHERE business_id=$1",[p.businessId]);
+    expect(await store.workerStatus(p.businessId)).toBeNull();
+    await pool.query("UPDATE ap_worker_status SET updated_at=now(),healthy=false WHERE business_id=$1",[p.businessId]);
+    expect(await store.workerStatus(p.businessId)).toBeNull();
   });
 });

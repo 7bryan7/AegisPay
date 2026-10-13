@@ -36,6 +36,8 @@ export class PayablesApi {
   detail(id: string) { return this.request(`/api/invoices/${encodeURIComponent(id)}`, invoiceDetailSchema); }
   audit(id: string) { return this.request(`/api/invoices/${encodeURIComponent(id)}/audit`, auditSchema); }
   treasury() { return this.request("/api/treasury", treasuryViewSchema); }
+  setPaused(paused: boolean) { return this.request("/api/treasury/pause", { parse: () => undefined }, {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ paused }) }); }
   imageUrl(id: string) { return `${this.baseUrl}/api/invoices/${encodeURIComponent(id)}/image`; }
   upload(file: File, key: string, hint: string) {
     const form = new FormData(); form.append("invoice", file);

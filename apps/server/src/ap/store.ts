@@ -11,6 +11,8 @@ export interface ApStore {
   audit(businessId: string, id: string): Promise<AuditView | null>;
   image(businessId: string, id: string): Promise<{ bytes: Buffer; mimeType: "image/png" | "image/jpeg" } | null>;
   treasury(businessId: string): Promise<Pick<TreasuryView, "walletAddress" | "paused" | "holdsMicroUsdc" | "minimumReserveMicroUsdc"> | null>;
+  setPaused(businessId: string, actorId: string, paused: boolean): Promise<void>;
+  workerStatus(businessId: string): Promise<{ extractionAvailable: boolean; paymentAvailable: boolean; dispatchEnabled: boolean } | null>;
   upload(claims: ApClaims, key: string, hint: string | null, bytes: Buffer, mime: string): Promise<{ obligationId: string; status: string; reused: boolean }>;
   approve(businessId: string, actorId: string, id: string, decisionId: string, reason: string): Promise<{ approvalId: string; expiresAt: string }>;
 }
@@ -65,14 +67,16 @@ export function createApStore(pool: Pool, retentionHours: number): ApStore {
       return invoiceDetailSchema.parse({ invoice: summary(row), facts: row.normalized, decision: row.decision_view, payment: row.payment_view,
         processingMessage: row.status === "RECEIVED" || row.status === "EXTRACTING"
           ? "Image saved and queued for extraction. Processing requires the configured extraction worker. No payment has been initiated by this upload."
-          : "Stored evaluation decision. Scheduling rechecks funding when due; eligible decisions are not transfers. Payment dispatch remains disabled." });
+          : "Stored evaluation decision. Scheduling rechecks funding when due; only a settled payment with receipt evidence confirms payment." });
     },
     async audit(businessId, id) {
-      if (!(await pool.query("SELECT id FROM ap_obligations WHERE business_id = $1 AND id = $2", [businessId, id])).rowCount) return null;
+      const invoice=(await pool.query<InvoiceRow>(`${invoiceSelect} WHERE o.business_id=$1 AND o.id=$2`,[businessId,id])).rows[0];
+      if (!invoice) return null;
       // Deliberate allowlist: never export raw payloads, model output, credentials or images.
       const result = await pool.query<{ event_key: string; event_type: string; entity_version: number; created_at: Date }>(
         "SELECT event_key, event_type, entity_version, created_at FROM ap_events WHERE business_id = $1 AND entity_id = $2 ORDER BY created_at, event_key LIMIT 500", [businessId, id]);
-      return auditSchema.parse({ events: result.rows.map((row) => ({ key: row.event_key, type: row.event_type, version: row.entity_version, createdAt: row.created_at.toISOString() })) });
+      return auditSchema.parse({ decision:invoice.decision_view,payment:invoice.payment_view,
+        events: result.rows.map((row) => ({ key: row.event_key, type: row.event_type, version: row.entity_version, createdAt: row.created_at.toISOString() })) });
     },
     async image(businessId, id) {
       const result = await pool.query<{ image_bytes: Buffer; mime_type: "image/png" | "image/jpeg" }>(
@@ -91,6 +95,24 @@ export function createApStore(pool: Pool, retentionHours: number): ApStore {
       return { walletAddress: row.wallet_address, paused: row.paused, holdsMicroUsdc: row.holds,
         minimumReserveMicroUsdc: reserve.success ? reserve.data : null };
     },
+    async workerStatus(businessId) {
+      const row=(await pool.query<{extraction_available:boolean;payment_available:boolean;dispatch_enabled:boolean}>(
+        "SELECT extraction_available,payment_available,dispatch_enabled FROM ap_worker_status WHERE business_id=$1 AND healthy AND updated_at>now()-interval '90 seconds'",[businessId])).rows[0];
+      return row?{extractionAvailable:row.extraction_available,paymentAvailable:row.payment_available,dispatchEnabled:row.dispatch_enabled}:null;
+    },
+    async setPaused(businessId, actorId, paused) {
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN");
+        const updated = await client.query<{policy_version:number}>("UPDATE ap_treasuries SET paused=$2 WHERE business_id=$1 RETURNING policy_version", [businessId, paused]);
+        if (updated.rowCount !== 1) throw new Error("TREASURY_UNAVAILABLE");
+        const { randomUUID } = await import("node:crypto");
+        await client.query(`INSERT INTO ap_events (business_id,event_key,actor_id,entity_id,entity_version,event_type,payload)
+          VALUES ($1,$2,$3,$1,$4,'TREASURY_PAUSE_CHANGED',$5::jsonb)`,
+          [businessId,"pause:"+randomUUID(),actorId,updated.rows[0]!.policy_version,JSON.stringify({paused,reason:paused?"Operator paused new payments":"Operator resumed policy-controlled payments"})]);
+        await client.query("COMMIT");
+      } catch(error) { await client.query("ROLLBACK"); throw error; } finally { client.release(); }
+    },
     async upload(claims, key, hint, bytes, mime) {
       if (claims.role !== "OPERATOR") throw new Error("OPERATOR_REQUIRED");
       return ingestObligation(pool, { businessId: claims.businessId, actorId: claims.actorId, role: "OPERATOR",
@@ -100,6 +122,7 @@ export function createApStore(pool: Pool, retentionHours: number): ApStore {
       const client = await pool.connect();
       try {
         await client.query("BEGIN");
+        await client.query("SELECT business_id FROM ap_treasuries WHERE business_id=$1 FOR UPDATE", [businessId]);
         const result = await client.query<{
           obligation_version: number; decision_id: string; action: string; policy_version: number;
           vendor_id: string; vendor_address: string; vendor_address_version: number;
@@ -108,14 +131,20 @@ export function createApStore(pool: Pool, retentionHours: number): ApStore {
         }>(`SELECT o.version AS obligation_version, d.id AS decision_id, d.action, d.policy_version,
           o.vendor_id, v.address AS vendor_address, v.address_version AS vendor_address_version,
           o.purchase_order_id, po.version AS purchase_order_version, o.amount_micro_usdc::text AS amount,
-          t.wallet_id, t.chain_id, t.token_address
+          t.wallet_id, t.chain_id, t.token_address, d.evaluated_at + interval '24 hours' AS decision_expires_at
           FROM ap_obligations o
           JOIN ap_decisions d ON d.business_id = o.business_id AND d.obligation_id = o.id
           JOIN ap_vendors v ON v.business_id = o.business_id AND v.id = o.vendor_id
           JOIN ap_purchase_orders po ON po.business_id = o.business_id AND po.id = o.purchase_order_id
           JOIN ap_treasuries t ON t.business_id = o.business_id
           WHERE o.business_id = $1 AND o.id = $2 AND d.id = $3
-          ORDER BY d.evaluated_at DESC FOR UPDATE OF o, v, po, t`, [businessId, id, decisionId]);
+            AND o.status='OPEN' AND o.lease_owner IS NULL AND d.obligation_version=o.version
+            AND d.policy_version=t.policy_version AND d.vendor_address_version=v.address_version
+            AND d.purchase_order_version=po.version AND v.status='APPROVED' AND po.delivery_accepted
+            AND d.id=(SELECT id FROM ap_decisions WHERE business_id=$1 AND obligation_id=$2 ORDER BY evaluated_at DESC,id DESC LIMIT 1)
+            AND NOT EXISTS (SELECT 1 FROM ap_payment_intents i WHERE i.business_id=$1 AND i.obligation_id=$2
+              AND i.state IN ('RESERVED','SUBMITTING','PENDING','UNKNOWN','SETTLED'))
+          ORDER BY d.evaluated_at DESC FOR UPDATE OF o, v, po`, [businessId, id, decisionId]);
         const row = result.rows[0];
         if (!row || row.decision_id !== decisionId || row.action !== "REQUIRE_APPROVAL" || row.decision_expires_at <= new Date()) throw new ApprovalConflict("APPROVAL_NOT_ELIGIBLE");
         const now = new Date();

@@ -5,7 +5,7 @@ import { normalizePayableExtraction, payableExtractionSchema, payableVendorSchem
 import { PAYABLE_EXTRACTION_PROMPT, type PayableExtractor } from "../extraction/payable.js";
 import { validateInvoiceImage } from "../extraction/image.js";
 import { preparePlanning, revalidatePlanning, heldDecision, type PlanningAdapters, type PreparedPlanning } from "../treasury/prepare.js";
-import { readPlanningState } from "../treasury/ledger.js";
+import { readPlanningState, planningFingerprint } from "../treasury/ledger.js";
 
 export type ExtractionClaim = {
   business_id: string; id: string; version: number; lease_owner: string;
@@ -20,6 +20,14 @@ export async function claimExtraction(pool: Pool, businessId: string): Promise<E
       AND (o.lease_expires_at IS NULL OR o.lease_expires_at <= now())
       AND NOT EXISTS (SELECT 1 FROM ap_payment_intents p WHERE p.business_id = o.business_id
         AND p.obligation_id = o.id AND p.state IN ('RESERVED','SUBMITTING','PENDING','UNKNOWN','SETTLED'))
+      AND NOT EXISTS (SELECT 1 FROM ap_approvals a JOIN ap_decisions d ON d.business_id=a.business_id AND d.id=a.decision_id
+        JOIN ap_treasuries t ON t.business_id=o.business_id
+        JOIN ap_vendors v ON v.business_id=o.business_id AND v.id=o.vendor_id
+        JOIN ap_purchase_orders p ON p.business_id=o.business_id AND p.id=o.purchase_order_id
+        WHERE a.business_id=o.business_id AND a.obligation_id=o.id AND a.granted AND a.consumed_at IS NULL AND a.expires_at>now()
+          AND d.obligation_version=o.version AND d.policy_version=t.policy_version
+          AND d.vendor_address_version=v.address_version AND d.purchase_order_version=p.version
+          AND d.id=(SELECT id FROM ap_decisions WHERE business_id=o.business_id AND obligation_id=o.id ORDER BY evaluated_at DESC,id DESC LIMIT 1))
     ORDER BY o.next_evaluation_at, o.id FOR UPDATE OF o SKIP LOCKED LIMIT 1
   ) UPDATE ap_obligations o SET lease_owner = $2, lease_expires_at = now() + interval '3 minutes',
     status = CASE WHEN raw_extraction IS NULL THEN 'EXTRACTING' ELSE status END
@@ -122,6 +130,8 @@ export async function finishExtraction(pool: Pool, claim: ExtractionClaim, raw: 
       facts && facts.issueDate <= facts.dueDate ? facts.issueDate : null, facts?.dueDate ?? null,
       action === "REJECT" ? "REJECTED" : "OPEN", version, nextEvaluation]);
     const decisionId = randomUUID();
+    // Binding the newly verified invoice to its PO changes the financial-state fingerprint.
+    const finalFingerprint = planning?.accounting?.status === "READY" ? planningFingerprint(await readPlanningState(client, claim.business_id)) : null;
     await client.query(`INSERT INTO ap_decisions (business_id, id, obligation_id, obligation_version,
       action, reason, evidence_ids, model_version, prompt_version, policy_version,
       vendor_address_version, purchase_order_version, treasury_snapshot, evaluated_at, expires_at, candidate)
@@ -136,7 +146,7 @@ export async function finishExtraction(pool: Pool, claim: ExtractionClaim, raw: 
       records.vendor?.addressVersion ?? null, records.po?.version ?? null,
       JSON.stringify(planning?.accounting?.status === "READY" ? { available: true, ...planning.accounting,
         cash: planning.evidence?.cash, fee: planning.evidence?.fee, ledgerAsOf: planning.evidence?.ledgerAsOf,
-        ledgerFingerprint: planning.fingerprint, dispatchEnabled: false } : { available: false }),
+        ledgerFingerprint: finalFingerprint, dispatchEnabled: false } : { available: false }),
       evaluatedAt.toISOString(), expiresAt.toISOString(), JSON.stringify(planning?.decision.candidate ?? null)]);
     await client.query(`INSERT INTO ap_events (business_id, event_key, actor_id, entity_id, entity_version, event_type, payload)
       VALUES ($1,$2,'extraction-worker',$3,$4,'OBLIGATION_EVALUATED',$5::jsonb)`,

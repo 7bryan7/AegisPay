@@ -632,3 +632,59 @@ No application database migration, model call, wallet operation, Circle request,
 **External side effects:** Live read-only RPC call to `https://rpc.testnet.arc.io`. No live transfers executed or database mutations outside disposable test schemas.
 
 **Outstanding:** Live Circle testnet transfer requires authorized user-provided `CIRCLE_API_KEY` and `CIRCLE_ENTITY_SECRET`. All core technical components of the accounts-payable pipeline are fully implemented and verified.
+
+## 2026-10-13, 10:32 IST — Circle adapter validation and conservative payment gates
+
+**Actor:** Codex, primary assistant; no subagents.
+
+**Requested scope:** Resume implementation, continuing Circle integration. The clean checkout had advanced to commit 23c481f since this chat's previous work. Inspected the new adapter, worker, reservation/dispatch/reconciliation and smoke code before editing. Preserved that implementation and the already pinned Circle SDK 10.8.1.
+
+### Changes and corrected claims
+
+- Hardened Circle configuration to require explicit Arc Testnet mode, configured UUID wallet identity/address, registered-secret format and fixed Circle endpoint. Fixture/disabled environment factories cannot construct live adapters.
+- Submission checks the provider's LIVE developer-controlled EOA wallet identity/network/address, snapshots request fields before awaits, preserves the supplied UUIDv4 key, converts exact integer money to decimal strings and uses explicit gas/max-fee/priority-fee values. Worst-case fees are rounded upward and must fit the supplied reserved fee allowance. No fee-level fallback, automatic replay, key generation, acceleration or cancellation is added.
+- Replaced overly strict response objects with validated projections that accept documented extra provider fields. Status reads require trusted expected terms and bind provider ID, wallet, sender, recipient, amount, network, transfer operation/type and separately retrieved token identity/decimals. COMPLETE without a hash is refused; returned status is not settlement.
+- Inspected installed SDK source: createTransaction maps SDK amount to REST amounts, spreads explicit fee fields and uses the supplied idempotency key when present. No live replay window or transfer path is claimed from that inspection. The adapter tests inject clients; they are not SDK HTTP transport or live Circle evidence.
+- Corrected reconciliation so STUCK remains pending. FAILED/CANCELLED/DENIED retain reservations until independent failure/debit/gas evidence exists. Mismatched provider IDs are rejected before settlement processing.
+- Live adapters advertise dispatchEnabled=false. The dispatcher checks it before any database claim, and the worker does not create new reservations with this disabled adapter. Existing read-only reconciliation continues. Disabled the old value-moving smoke path before any RPC/model/wallet action: it generated a new unpersisted key on each run. Its read-only dry-run remains available.
+- Corrected doctor and README readiness claims. **Correction to the 11 October “fully implemented and verified” claim:** source inspection found missing fresh pre-dispatch policy/version/approval validation, unpersisted absolute fee terms, unsafe terminal-failure hold release, and an unjournaled smoke path. Previously reported test passes do not prove these financial invariants. Existing worker logs said dispatch was disabled even though dispatch was called; the disabled state now has an actual execution gate.
+
+### Verification
+
+- Passed: focused Circle/reconciliation/gating suite, **32 tests**, under Node 22.23.2. Covers exact large amounts, fee rounding/caps, incorrect network/token/wallet/recipient/custody, full provider responses, input mutation, fixture isolation, no retry after uncertainty, disabled dispatch before claiming, and retained STUCK/terminal-failure holds.
+- Passed: server typecheck, server production compilation, final root/script/test typecheck, focused ESLint for all seven changed TypeScript files and git diff --check. Initial root check found only new test mock tuple/literal typing issues; corrected before passing.
+- Full regular regression is in progress; result will be appended below. PostgreSQL, browser/full Next.js build and live integration checks were not run in this unit. Database setup was not changed. Prior PostgreSQL/browser/live RPC results remain historical claims, not rerun evidence.
+- Original migrations 001–003 have no changes relative to HEAD. No schema, dependency/lockfile, frontend or credential file changes were made.
+- Rechecked official [Circle transfer API](https://developers.circle.com/api-reference/wallets/developer-controlled-wallets/create-developer-transaction-transfer) fee/key fields and [transaction states](https://developers.circle.com/api-reference/wallets/transaction-states-and-errors), plus installed SDK types/source.
+
+**Side effects:** public documentation reads, local tests and compiler outputs only. No database connection/mutation, live Circle/RPC call, model inference, transfer, deployment or external message.
+
+**Remaining:** Persist exact absolute fee terms and authorization with intents; implement fresh locked pre-dispatch revalidation, safe replay/restart handling and independent failure/gas reconciliation; validate SDK transport bounds and actual Circle/Arc transfer encoding. Then verify database behavior and a bounded durable live smoke. No live settlement was produced, and production submission remains disabled.
+
+**Final verification:** Full regular regression passed under Node 22.23.2: **29 files / 227 tests**, using vitest run --maxWorkers=2 outside the Windows sandbox (97 seconds). No failures. Server/root typechecks, server production compilation and focused lint passed as recorded above. Database/browser/live checks remain unrun in this unit.
+
+## 2026-10-13, 11:08 IST — Offline authorization, recovery and settlement completion
+
+**Actor:** Codex primary assistant; no subagents.
+
+**Scope:** User requested completion and explicitly answered “Finish offline work; live setup later.” Continued existing modified work without resetting the checkout. Secret presence checks found Circle/Gemini setup missing; no secret values were printed or changed.
+
+**Delivered:**
+- Added shared payment authorization under the treasury lock. Reservation and dispatch validate current obligation/vendor/PO/policy versions, independent verification, exact approval, candidate timing, fresh cash/fee evidence, complete ledger, hard limits and pause state. Fixed post-PO-binding planning fingerprints. Canonical sorted hashing preserves immutable JSON terms across PostgreSQL JSONB ordering. Persisted exact gas/max-fee/priority-fee bounds, wallet address and fee allowance with the provider key before submission.
+- Dispatch re-reads external evidence, locks and rechecks before committing SUBMITTING, then submits only the stored terms. Changed unsubmitted authorizations cancel and release atomically. Timeout retains UNKNOWN and its hold. Expired submission leases recover to UNKNOWN without creating a replacement key or sending again. Unknown attempts without a provider ID remain unresolved for investigation.
+- Reconciliation now validates full receipt identity, recipient, amount, block binding and native/micro fee conversion. Terminal writes lock the treasury and atomically update payment, reservation, PO, obligation, approval and audit with checked row counts. Only provider COMPLETE plus independent SUCCESS settles; FAILED plus independently verified REVERTED releases the payout hold and records failed gas. DENIED/CANCELLED without independent evidence remain held. Concurrent/no-op reconciliation no longer falsely reports settlement.
+- Historical receipts are reverified against fresh cash for subsequent treasury accounting. Approvals reject stale decisions/versions and survive worker queue processing until dispatched or invalidated. Worker ordering reconciles/recoveries first, preserves approvals and reserves after planning. Pause stops new dispatch but not reconciliation.
+- Added operator-only, origin/CSRF-protected pause/resume, a single read-only Arc balance when configured, truthful fixture settlement labels, and decision/payment references in private audit exports. Added migration 005 for operational worker heartbeat; stale/failed workers report unavailable in readiness/dashboard. Existing migrations 001–004 remain unchanged.
+- Circle wait is bounded to 15 seconds per operation without claiming network cancellation. Late SDK completion cannot trigger automatic replay. Added a real installed-SDK loopback HTTP test verifying exact amount/key/absolute fee wire fields and decrypting ciphertext using generated test RSA keys. SDK sends fee fields at REST top level, as confirmed by the test. No real Circle call is part of that test.
+- Replaced the unjournaled smoke with a persisted-intent-only command capped at one USDC. Added explicit PAYMENT_DISPATCH_ENABLED=false default in the example environment. Actual local credentials/settings were not enabled. Bootstrap registry remains insert-only; optional policy editing/Q&A/discount UI remain cut per README.
+
+**Verification:**
+- Passed: full regular suite, 30 files / 230 tests; real PostgreSQL suite, 35 tests; browser suite, 4 tests using Edge and dedicated synthetic servers. Browser scenario exercises upload, approval, labeled synthetic settlement, export and pause; it is not chain/model evidence.
+- Passed: core compilation, server production compilation, root/script/test typecheck, full ESLint and Next.js production build. Final small doctor/type contract edits are being checked separately below.
+- Initial failures were corrected: PostgreSQL sandbox networking required authorized local execution; one new expired-lease fixture lacked its paired owner; receipt fixtures accidentally reused a globally unique hash; the SDK wire assertion initially expected nested rather than top-level fee fields; an API fixture assertion expected an old fixed approval expiry. Final suites above pass. Lint/type errors in new typed fixtures were fixed.
+
+**Side effects:** Created and dropped disposable PostgreSQL test schemas; confirmed the configured application database is loopback and applied forward migration 005_worker_status.sql there. Migrations 001–004 were already applied and unchanged. Local compiler/browser artifacts and loopback HTTP calls only. No live Circle/RPC/Gemini invocation, wallet creation/funding/transfer, deployment, publication or external message in this unit.
+
+**Remaining / scope limits:** Live configuration and one real extraction plus bounded testnet settlement are explicitly deferred. Real Circle encoding/receipt acceptance remains unverified despite installed-SDK and verifier fixtures. Unknown-without-ID and pre-hardening intents require review; holds intentionally remain. The archive ZIP is still unavailable on this host. Optional advanced UI, public release/video and actual business traction are not claimed complete. See README deferred acceptance section for the next live run.
+
+**Final verification, 11:12 IST:** Final root/script/test typecheck and focused lint for the last doctor/adapter contract changes passed. The final full regular suite passed 230 tests, PostgreSQL passed 35, and browser acceptance passed 4. Core/server/Next production builds and full lint passed as recorded above. Whitespace-only EOF cleanup followed; no payment behavior changed. Local development migration 005 was applied successfully after confirming the database endpoint is loopback; no worker or live dependency was started. Live acceptance remains intentionally deferred by the user.

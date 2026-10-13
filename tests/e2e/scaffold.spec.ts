@@ -49,3 +49,25 @@ test("backend outage is visible without fabricated balances", async ({ page }) =
   await expect(page.getByRole("status")).toContainText("Backend unavailable");
   await expect(page.getByRole("button", { name: "Sign in", exact: true })).toBeDisabled();
 });
+
+test("synthetic approval and settlement are visible with exportable evidence and pause controls",async({page})=>{
+  await page.goto("/dashboard");
+  await page.getByLabel("Access code").fill("synthetic-operator-code");
+  await page.getByRole("button",{name:"Sign in",exact:true}).click();
+  await page.getByRole("button",{name:"Resume treasury",exact:true}).click();
+  await expect(page.getByRole("button",{name:"Pause treasury",exact:true})).toBeVisible();
+  await page.getByRole("button",{name:"Pause treasury",exact:true}).click();
+  await page.getByLabel("Purchase order reference (optional)").fill("SYNTHETIC-PAYMENT-SCENARIO");
+  await page.getByLabel("Invoice image").setInputFiles("fixtures/synthetic-invoice-2.png");
+  await page.getByRole("button",{name:"Save invoice",exact:true}).click();
+  await expect(page.getByText("Synthetic amount exceeds automatic threshold.",{exact:false})).toBeVisible();
+  await page.getByLabel("Operator approval rationale").fill("Synthetic test approval");
+  await page.getByRole("button",{name:"Approve invoice",exact:true}).click();
+  await expect(page.getByText("Synthetic settlement fixture. No real transfer occurred.",{exact:true})).toBeVisible();
+  await expect(page.getByText("synthetic payment settled",{exact:true})).toBeVisible();
+  const downloaded=page.waitForEvent("download");
+  await page.getByRole("button",{name:"Export activity",exact:true}).click();
+  const stream=await(await downloaded).createReadStream();let json="";
+  for await(const chunk of stream) json+=String(chunk);
+  expect(JSON.parse(json)).toMatchObject({payment:{state:"SETTLED",verificationReference:"synthetic-receipt-not-chain-evidence"}});
+});

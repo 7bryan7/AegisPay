@@ -10,6 +10,7 @@ export type PlanningAdapters = {
   planner: PayablePlanner | null;
   readCash(treasury: PlanningState["treasury"]): Promise<TreasuryAccountingInput["cash"]>;
   estimateFee(cash: TreasuryAccountingInput["cash"], recipient: string, amount: string): Promise<NonNullable<TreasuryAccountingInput["fee"]>>;
+  verifyPayments?(cash: TreasuryAccountingInput["cash"], payments: TreasuryAccountingInput["payments"]): Promise<TreasuryAccountingInput["payments"]>;
 };
 export type PreparedPlanning = AccountedDecision & {
   fingerprint: string | null; evidence: Omit<TreasuryAccountingInput, "candidate" | "policy" | "businessId" | "now"> | null;
@@ -52,8 +53,9 @@ export async function preparePlanning(pool: Pool, claim: ExtractionClaim, raw: P
     const state = await readPlanningState(pool, claim.business_id);
     const fingerprint = planningFingerprint(state);
     if (fingerprint !== planningFingerprint(before)) return hold("PLANNING_STATE_CHANGED");
+    const payments = adapters.verifyPayments ? await adapters.verifyPayments(cash, state.payments) : state.payments;
     const evidence = { cash, fee, paused: state.treasury.paused, ledgerAsOf: clock().toISOString(),
-      coverageFrom: "1970-01-01T00:00:00.000Z", payments: state.payments,
+      coverageFrom: "1970-01-01T00:00:00.000Z", payments,
       // The schema has no optional essential flag: conservatively protect every accepted open PO.
       commitments: state.purchaseOrders.map((p) => ({ businessId: p.businessId, purchaseOrderId: p.id,
         obligationId: p.activeObligationId, outstandingMicroUsdc: p.outstandingMicroUsdc, dueDate: p.dueDate,

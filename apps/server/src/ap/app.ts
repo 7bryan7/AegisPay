@@ -11,6 +11,7 @@ import { IngestionConflict } from "../obligations/ingest.js";
 import type { ApConfig } from "./config.js";
 import { apCookie, apSessionTtl, issueApSession, readApSession, type ApClaims } from "./session.js";
 import { ApprovalConflict, type ApStore } from "./store.js";
+import { createArcReconciliationFromEnvironment } from "../payments/reconcile.js";
 
 export function createApApp(config: ApConfig, store: ApStore | null = null) {
   const app = express();
@@ -53,8 +54,11 @@ export function createApApp(config: ApConfig, store: ApStore | null = null) {
   app.get("/ready", async (_request, response) => {
     let storage = false;
     try { storage = store !== null && await store.ready(config.BUSINESS_ID); } catch { /* report no details */ }
-    response.status(503).json({ status: "unavailable", authentication: loginAvailable, storage,
-      extractionWorker: false, paymentWorker: false, dispatchEnabled: false });
+    let workers: Awaited<ReturnType<ApStore["workerStatus"]>>=null;
+    try {if(storage) workers=await store!.workerStatus(config.BUSINESS_ID);} catch { /* Missing/stale heartbeat is unavailable. */ }
+    const ready=loginAvailable && storage && workers?.extractionAvailable===true && workers.paymentAvailable;
+    response.status(ready?200:503).json({ status: ready?"ready":"unavailable", authentication: loginAvailable, storage,
+      extractionWorker: workers?.extractionAvailable??false, paymentWorker: workers?.paymentAvailable??false, dispatchEnabled: workers?.dispatchEnabled??false });
   });
   app.get("/api/session", (request, response) => {
     const session = readApSession(request.header("cookie"), config.SESSION_SECRET, config.BUSINESS_ID);
@@ -130,15 +134,28 @@ export function createApApp(config: ApConfig, store: ApStore | null = null) {
     }
     response.status(201).json(result);
   });
+  app.post("/api/treasury/pause", trustedOrigin, operator, csrf, sessionLimit, async (request, response) => {
+    const session=claims(request), input=z.strictObject({paused:z.boolean()}).parse(request.body);
+    await database(session.businessId,db=>db.setPaused(session.businessId,session.actorId,input.paused));
+    response.status(204).end();
+  });
   app.get("/api/treasury", sessionLimit, async (request, response) => {
     const session = claims(request);
     const stored = session.role === "OPERATOR" ? await database(session.businessId, (db) => db.treasury(session.businessId)) : null;
+    let cashMicroUsdc: string | null=null;
+    if (config.PAYMENT_MODE==="arc_testnet" && stored?.walletAddress && stored.walletAddress===process.env.ARC_WALLET_ADDRESS) {
+      try { cashMicroUsdc=(await createArcReconciliationFromEnvironment(process.env)?.cashReader.read())?.cashMicroUsdc??null; }
+      catch { /* An unavailable RPC never produces a fabricated balance. */ }
+    }
+    let workers: Awaited<ReturnType<ApStore["workerStatus"]>>=null;
+    if (stored) {try {workers=await store!.workerStatus(session.businessId);} catch { /* Fail closed. */ }}
+    const dispatchEnabled=config.PAYMENT_MODE==="arc_testnet" && workers?.dispatchEnabled===true && stored?.paused===false;
     response.json(treasuryViewSchema.parse({ network: "Arc Testnet", configuredMode: config.PAYMENT_MODE,
-      dispatchEnabled: false, screening: "local_registry", walletAddress: stored?.walletAddress ?? null,
-      paused: stored?.paused ?? true, cashMicroUsdc: null, holdsMicroUsdc: stored?.holdsMicroUsdc ?? null,
+      dispatchEnabled, screening: "local_registry", walletAddress: stored?.walletAddress ?? null,
+      paused: stored?.paused ?? true, cashMicroUsdc, holdsMicroUsdc: stored?.holdsMicroUsdc ?? null,
       minimumReserveMicroUsdc: stored?.minimumReserveMicroUsdc ?? null,
       message: session.role === "REVIEWER" ? "Reviewer access is isolated from private treasury data. No sanitized examples are available yet."
-        : "Live balance and payment worker are unavailable. Payments cannot be submitted." }));
+        : `${cashMicroUsdc===null?"Live balance unavailable.":"Balance read from Arc Testnet."} ${workers?"Recent worker heartbeat received.":"Worker heartbeat missing or stale."} ${dispatchEnabled?"Dispatch is configured; every payment still requires fresh checks.":"New payment submissions are disabled."}` }));
   });
   app.use(notFound);
   app.use(errorHandler);

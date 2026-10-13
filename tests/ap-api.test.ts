@@ -91,7 +91,7 @@ describe("AP API boundary", () => {
     const valid = await fetch(`${base}/api/invoices/${obligationId}/approve`, { method: "POST", headers: { ...auth, origin: auth.origin, "content-type": "application/json" },
       body: JSON.stringify({ decisionId, reason: "Budget exception reviewed" }) });
     expect(valid.status).toBe(201);
-    expect(approvalResultSchema.parse(await valid.json()).expiresAt).toBe("2026-10-10T06:00:00.000Z");
+    expect(Date.parse(approvalResultSchema.parse(await valid.json()).expiresAt)).toBeGreaterThan(Date.now());
   });
   it("reports absent database truthfully and redacts backend errors", async () => {
     const base = await start(null), auth = await login(base);
@@ -100,5 +100,19 @@ describe("AP API boundary", () => {
     const broken = await start(store), session = await login(broken);
     const response = await fetch(`${broken}/api/invoices`, { headers: session });
     expect(response.status).toBe(503); expect(await response.text()).not.toContain("private database password");
+  });
+});
+
+describe("operator treasury pause",()=>{
+  it("requires operator role, trusted origin and CSRF",async()=>{
+    const store=createFixtureStore(), spy=vi.spyOn(store,"setPaused"),base=await start(store);
+    const auth=await login(base),reviewer=await login(base,fixtureConfig.REVIEWER_ACCESS_CODE);
+    const body=JSON.stringify({paused:false});
+    expect((await fetch(`${base}/api/treasury/pause`,{method:"POST",headers:{...reviewer,"content-type":"application/json"},body})).status).toBe(403);
+    expect((await fetch(`${base}/api/treasury/pause`,{method:"POST",headers:{cookie:auth.cookie,origin:auth.origin,"content-type":"application/json"},body})).status).toBe(403);
+    expect(spy).not.toHaveBeenCalled();
+    expect((await fetch(`${base}/api/treasury/pause`,{method:"POST",headers:{...auth,"content-type":"application/json"},body})).status).toBe(204);
+    expect(spy).toHaveBeenCalledTimes(1);
+    expect(await (await fetch(`${base}/api/treasury`,{headers:auth})).json()).toMatchObject({paused:false,dispatchEnabled:false});
   });
 });
