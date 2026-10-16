@@ -1,0 +1,370 @@
+{
+  "synthetic": true,
+  "audit": {
+    "events": [
+      {
+        "key": "received:fd322a18-0605-4f0a-97c1-13862b099507",
+        "type": "INVOICE_RECEIVED",
+        "version": 1,
+        "createdAt": "2026-10-15T18:19:36.565Z",
+        "actorId": "synthetic-business:operator",
+        "reason": null
+      },
+      {
+        "key": "evaluated:9bbac218-e9a0-4656-99cc-c08cbaf165f0",
+        "type": "OBLIGATION_EVALUATED",
+        "version": 2,
+        "createdAt": "2026-10-15T18:19:36.903Z",
+        "actorId": "extraction-worker",
+        "reason": null
+      },
+      {
+        "key": "approval:ac852d53-53d3-44a3-b3ba-dab39e208bff",
+        "type": "APPROVAL_GRANTED",
+        "version": 2,
+        "createdAt": "2026-10-15T18:19:39.639Z",
+        "actorId": "synthetic-business:operator",
+        "reason": null
+      },
+      {
+        "key": "reserved:d5e55023-457a-4be0-9487-e8c9bda0f865",
+        "type": "PAYMENT_RESERVED",
+        "version": 2,
+        "createdAt": "2026-10-15T18:19:39.865Z",
+        "actorId": "payment-worker",
+        "reason": null
+      },
+      {
+        "key": "submitting:d5e55023-457a-4be0-9487-e8c9bda0f865",
+        "type": "PAYMENT_SUBMITTING",
+        "version": 2,
+        "createdAt": "2026-10-15T18:19:39.939Z",
+        "actorId": "payment-worker",
+        "reason": null
+      },
+      {
+        "key": "submitted:d5e55023-457a-4be0-9487-e8c9bda0f865",
+        "type": "PAYMENT_PENDING",
+        "version": 2,
+        "createdAt": "2026-10-15T18:19:39.959Z",
+        "actorId": "payment-worker",
+        "reason": null
+      },
+      {
+        "key": "terminal:d5e55023-457a-4be0-9487-e8c9bda0f865",
+        "type": "PAYMENT_SETTLED",
+        "version": 2,
+        "createdAt": "2026-10-15T18:19:39.973Z",
+        "actorId": "payment-worker",
+        "reason": null
+      }
+    ],
+    "decision": {
+      "id": "9bbac218-e9a0-4656-99cc-c08cbaf165f0",
+      "action": "REQUIRE_APPROVAL",
+      "reason": "SOFT_THRESHOLD",
+      "evidenceIds": [
+        "source:vendorName",
+        "source:invoiceNumber",
+        "source:purchaseOrderReference",
+        "source:currency",
+        "source:issueDate",
+        "source:dueDate",
+        "source:subtotal",
+        "source:tax",
+        "source:total",
+        "synthetic-fee"
+      ],
+      "evaluatedAt": "2026-10-15T18:19:36.934Z",
+      "expiresAt": "2026-10-15T18:20:06.798Z",
+      "nextEvaluationAt": "2026-10-15T18:24:36.934Z",
+      "versions": {
+        "invoice": 2,
+        "policy": 1,
+        "vendor": 2,
+        "purchaseOrder": 1
+      },
+      "candidate": null,
+      "treasury": {
+        "available": true,
+        "snapshot": {
+          "capturedAt": "2026-10-15T18:19:36.798Z",
+          "cashMicroUsdc": "20000000",
+          "unreflectedHoldsMicroUsdc": "0",
+          "protectedObligationsMicroUsdc": "0",
+          "feeAllowanceMicroUsdc": "21",
+          "dailySettledMicroUsdc": "0",
+          "dailyHoldsMicroUsdc": "0",
+          "categorySettledMicroUsdc": "0",
+          "categoryHoldsMicroUsdc": "0",
+          "inclusionEvidenceVerified": true,
+          "hasInFlightTransfer": false,
+          "paused": false
+        },
+        "cash": {
+          "chainId": 5042002,
+          "tokenAddress": "0x3600000000000000000000000000000000000000",
+          "walletAddress": "0x1111111111111111111111111111111111111111",
+          "cashMicroUsdc": "20000000",
+          "blockNumber": "100",
+          "blockHash": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "blockTimestamp": "2026-10-15T18:19:36.798Z",
+          "capturedAt": "2026-10-15T18:19:36.798Z",
+          "observedAt": "2026-10-15T18:19:36.798Z"
+        },
+        "fee": {
+          "chainId": 5042002,
+          "tokenAddress": "0x3600000000000000000000000000000000000000",
+          "walletAddress": "0x1111111111111111111111111111111111111111",
+          "recipient": "0x2222222222222222222222222222222222222222",
+          "amountMicroUsdc": "1500000",
+          "cashBlockHash": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "capturedAt": "2026-10-15T18:19:36.803Z",
+          "evidenceReference": "synthetic-fee",
+          "gasLimit": "21000",
+          "maxFeePerGasNative": "1000000000",
+          "bufferBps": 0,
+          "extraBufferMicroUsdc": "0"
+        },
+        "availableMicroUsdc": "14999979",
+        "dailyHeadroomMicroUsdc": "10000000",
+        "categoryHeadroomMicroUsdc": "8000000",
+        "totalHeldMicroUsdc": "0",
+        "reflectedHeldMicroUsdc": "0",
+        "evidenceReferences": [
+          "synthetic-fee"
+        ],
+        "ledgerAsOf": "2026-10-15T18:19:36.813Z",
+        "ledgerFingerprint": "3defb4d48a9f019a827b5346b0292ab177681765f80108d9fc1024965c44f12e",
+        "discountComparison": null,
+        "annualCashPreservationCostBps": 0
+      },
+      "alternativeConsidered": null,
+      "similarInvoiceIds": []
+    },
+    "payment": {
+      "id": "d5e55023-457a-4be0-9487-e8c9bda0f865",
+      "state": "SETTLED",
+      "providerId": "synthetic-1792088379959",
+      "providerState": "COMPLETE",
+      "transactionHash": "0xac6023be5978493b5b74130243a6f7cb00610d8fa16aca0e298e61d5f4494073",
+      "settledAt": "2026-10-15T18:19:39.973Z",
+      "actualFeeMicroUsdc": "21",
+      "verificationReference": "synthetic-durable-receipt",
+      "payoutAmountMicroUsdc": "1500000",
+      "nominalAmountMicroUsdc": "1500000",
+      "discountAdjustmentMicroUsdc": "0"
+    },
+    "invoice": {
+      "id": "fd322a18-0605-4f0a-97c1-13862b099507",
+      "status": "SETTLED",
+      "version": 2,
+      "invoiceNumber": "TEST-1",
+      "vendorName": "Synthetic vendor",
+      "amountMicroUsdc": "1500000",
+      "dueDate": "2026-10-09",
+      "createdAt": "2026-10-15T18:19:36.565Z",
+      "decision": "REQUIRE_APPROVAL",
+      "paymentState": "SETTLED"
+    },
+    "facts": {
+      "businessId": "synthetic-business",
+      "id": "fd322a18-0605-4f0a-97c1-13862b099507",
+      "version": 2,
+      "vendorName": "Synthetic vendor",
+      "invoiceNumber": "TEST-1",
+      "purchaseOrderId": "po",
+      "currency": "USD",
+      "issueDate": "2026-10-01",
+      "dueDate": "2026-10-09",
+      "subtotalMicroUsdc": "1400000",
+      "taxMicroUsdc": "100000",
+      "amountMicroUsdc": "1500000",
+      "printedAddress": null,
+      "serviceDescription": null,
+      "servicePeriod": null,
+      "paymentTerms": null,
+      "lineItems": [],
+      "evidence": [
+        {
+          "id": "source:vendorName",
+          "field": "vendorName",
+          "status": "EXTRACTED",
+          "rawText": "Synthetic vendor",
+          "sourceReference": null
+        },
+        {
+          "id": "source:invoiceNumber",
+          "field": "invoiceNumber",
+          "status": "EXTRACTED",
+          "rawText": "TEST-1",
+          "sourceReference": null
+        },
+        {
+          "id": "source:purchaseOrderReference",
+          "field": "purchaseOrderId",
+          "status": "EXTRACTED",
+          "rawText": "po",
+          "sourceReference": null
+        },
+        {
+          "id": "source:currency",
+          "field": "currency",
+          "status": "EXTRACTED",
+          "rawText": "USD",
+          "sourceReference": null
+        },
+        {
+          "id": "source:issueDate",
+          "field": "issueDate",
+          "status": "EXTRACTED",
+          "rawText": "2026-10-01",
+          "sourceReference": null
+        },
+        {
+          "id": "source:dueDate",
+          "field": "dueDate",
+          "status": "EXTRACTED",
+          "rawText": "2026-10-09",
+          "sourceReference": null
+        },
+        {
+          "id": "source:subtotal",
+          "field": "subtotalMicroUsdc",
+          "status": "EXTRACTED",
+          "rawText": "1.40",
+          "sourceReference": null
+        },
+        {
+          "id": "source:tax",
+          "field": "taxMicroUsdc",
+          "status": "EXTRACTED",
+          "rawText": "0.10",
+          "sourceReference": null
+        },
+        {
+          "id": "source:total",
+          "field": "amountMicroUsdc",
+          "status": "EXTRACTED",
+          "rawText": "1.50",
+          "sourceReference": null
+        }
+      ]
+    },
+    "decisions": [
+      {
+        "id": "9bbac218-e9a0-4656-99cc-c08cbaf165f0",
+        "action": "REQUIRE_APPROVAL",
+        "reason": "SOFT_THRESHOLD",
+        "evidenceIds": [
+          "source:vendorName",
+          "source:invoiceNumber",
+          "source:purchaseOrderReference",
+          "source:currency",
+          "source:issueDate",
+          "source:dueDate",
+          "source:subtotal",
+          "source:tax",
+          "source:total",
+          "synthetic-fee"
+        ],
+        "evaluatedAt": "2026-10-15T18:19:36.934Z",
+        "expiresAt": "2026-10-15T18:20:06.798Z",
+        "nextEvaluationAt": "2026-10-15T18:24:36.934Z",
+        "versions": {
+          "invoice": 2,
+          "policy": 1,
+          "vendor": 2,
+          "purchaseOrder": 1
+        },
+        "candidate": null,
+        "treasury": {
+          "available": true,
+          "snapshot": {
+            "capturedAt": "2026-10-15T18:19:36.798Z",
+            "cashMicroUsdc": "20000000",
+            "unreflectedHoldsMicroUsdc": "0",
+            "protectedObligationsMicroUsdc": "0",
+            "feeAllowanceMicroUsdc": "21",
+            "dailySettledMicroUsdc": "0",
+            "dailyHoldsMicroUsdc": "0",
+            "categorySettledMicroUsdc": "0",
+            "categoryHoldsMicroUsdc": "0",
+            "inclusionEvidenceVerified": true,
+            "hasInFlightTransfer": false,
+            "paused": false
+          },
+          "cash": {
+            "chainId": 5042002,
+            "tokenAddress": "0x3600000000000000000000000000000000000000",
+            "walletAddress": "0x1111111111111111111111111111111111111111",
+            "cashMicroUsdc": "20000000",
+            "blockNumber": "100",
+            "blockHash": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "blockTimestamp": "2026-10-15T18:19:36.798Z",
+            "capturedAt": "2026-10-15T18:19:36.798Z",
+            "observedAt": "2026-10-15T18:19:36.798Z"
+          },
+          "fee": {
+            "chainId": 5042002,
+            "tokenAddress": "0x3600000000000000000000000000000000000000",
+            "walletAddress": "0x1111111111111111111111111111111111111111",
+            "recipient": "0x2222222222222222222222222222222222222222",
+            "amountMicroUsdc": "1500000",
+            "cashBlockHash": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "capturedAt": "2026-10-15T18:19:36.803Z",
+            "evidenceReference": "synthetic-fee",
+            "gasLimit": "21000",
+            "maxFeePerGasNative": "1000000000",
+            "bufferBps": 0,
+            "extraBufferMicroUsdc": "0"
+          },
+          "availableMicroUsdc": "14999979",
+          "dailyHeadroomMicroUsdc": "10000000",
+          "categoryHeadroomMicroUsdc": "8000000",
+          "totalHeldMicroUsdc": "0",
+          "reflectedHeldMicroUsdc": "0",
+          "evidenceReferences": [
+            "synthetic-fee"
+          ],
+          "ledgerAsOf": "2026-10-15T18:19:36.813Z",
+          "ledgerFingerprint": "3defb4d48a9f019a827b5346b0292ab177681765f80108d9fc1024965c44f12e",
+          "discountComparison": null,
+          "annualCashPreservationCostBps": 0
+        },
+        "alternativeConsidered": null,
+        "similarInvoiceIds": []
+      }
+    ],
+    "approvals": [
+      {
+        "id": "ac852d53-53d3-44a3-b3ba-dab39e208bff",
+        "terms": {
+          "businessId": "synthetic-business",
+          "obligationId": "fd322a18-0605-4f0a-97c1-13862b099507",
+          "decisionId": "9bbac218-e9a0-4656-99cc-c08cbaf165f0",
+          "walletId": "synthetic-wallet:synthetic-business",
+          "obligationVersion": 2,
+          "vendorId": "vendor",
+          "vendorAddressVersion": 2,
+          "purchaseOrderId": "po",
+          "purchaseOrderVersion": 1,
+          "policyVersion": 1,
+          "recipient": "0x2222222222222222222222222222222222222222",
+          "amountMicroUsdc": "1500000",
+          "chainId": 5042002,
+          "token": "0x3600000000000000000000000000000000000000"
+        },
+        "actorId": "synthetic-business:operator",
+        "role": "OPERATOR",
+        "granted": true,
+        "reason": "Exact durable synthetic approval",
+        "grantedAt": "2026-10-15T18:19:39.647Z",
+        "expiresAt": "2026-10-16T18:19:39.647Z",
+        "consumedAt": "2026-10-15T18:19:39.973Z"
+      }
+    ],
+    "corrections": [],
+    "truncated": false
+  }
+}

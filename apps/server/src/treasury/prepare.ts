@@ -1,5 +1,5 @@
 import type { Pool } from "pg";
-import { normalizePayableExtraction, verifyObligation, type PayableExtraction, type TreasuryAccountingInput, type NormalizedObligation } from "@agentpay/core";
+import { paymentAmounts, normalizeReviewedExtraction, verifyObligation, type PayableExtraction, type TreasuryAccountingInput, type NormalizedObligation } from "@agentpay/core";
 import type { ExtractionClaim } from "../obligations/process.js";
 import type { PayablePlanner, BoundedDecision, PlanningContext } from "../agent/planner.js";
 import { planAccountedPayable, type AccountedDecision } from "./evaluate.js";
@@ -37,7 +37,7 @@ export async function revalidatePlanning(prepared: PreparedPlanning, state: Plan
 export async function preparePlanning(pool: Pool, claim: ExtractionClaim, raw: PayableExtraction,
   adapters: PlanningAdapters, clock: () => Date = () => new Date()): Promise<PreparedPlanning> {
   const hold = (reason: string): PreparedPlanning => ({ accounting: null, decision: heldDecision(reason), fingerprint: null, evidence: null });
-  const normalized = normalizePayableExtraction(raw, { businessId: claim.business_id, id: claim.id, version: claim.version + 1 });
+  const normalized = normalizeReviewedExtraction(raw, claim.owner_corrections, { businessId: claim.business_id, id: claim.id, version: claim.version + 1 });
   if (normalized.status !== "NORMALIZED") return hold("OBLIGATION_NOT_VERIFIED");
   const obligation = normalized.obligation;
   if (claim.purchase_order_hint && claim.purchase_order_hint !== obligation.purchaseOrderId) return hold("PURCHASE_ORDER_HINT_MISMATCH");
@@ -49,17 +49,18 @@ export async function preparePlanning(pool: Pool, claim: ExtractionClaim, raw: P
     if (before.treasury.mode !== adapters.mode) return hold("PLANNING_MODE_MISMATCH");
     const cash = await adapters.readCash(structuredClone(before.treasury));
     if (cash.walletAddress !== before.treasury.walletAddress) return hold("PLANNING_WALLET_MISMATCH");
-    const fee = await adapters.estimateFee(structuredClone(cash), vendor.address, obligation.amountMicroUsdc);
+    const amounts = paymentAmounts(obligation.amountMicroUsdc, obligation.dueDate, po?.verifiedDiscount,
+      clock().toISOString(), before.treasury.policy.annualCashPreservationCostBps);
+    const fee = await adapters.estimateFee(structuredClone(cash), vendor.address, amounts.amountMicroUsdc);
     const state = await readPlanningState(pool, claim.business_id);
     const fingerprint = planningFingerprint(state);
     if (fingerprint !== planningFingerprint(before)) return hold("PLANNING_STATE_CHANGED");
     const payments = adapters.verifyPayments ? await adapters.verifyPayments(cash, state.payments) : state.payments;
     const evidence = { cash, fee, paused: state.treasury.paused, ledgerAsOf: clock().toISOString(),
       coverageFrom: "1970-01-01T00:00:00.000Z", payments,
-      // The schema has no optional essential flag: conservatively protect every accepted open PO.
       commitments: state.purchaseOrders.map((p) => ({ businessId: p.businessId, purchaseOrderId: p.id,
         obligationId: p.activeObligationId, outstandingMicroUsdc: p.outstandingMicroUsdc, dueDate: p.dueDate,
-        accepted: p.deliveryAccepted, essential: true, status: p.outstandingMicroUsdc === "0" ? "SETTLED" as const : "OPEN" as const })) };
+        accepted: p.deliveryAccepted, essential: p.essential ?? true, status: p.outstandingMicroUsdc === "0" ? "SETTLED" as const : "OPEN" as const })) };
     const result = await planAccountedPayable({ obligation, vendor, purchaseOrder: po, policy: state.treasury.policy,
       duplicateOrSettled: false, exactApprovalValid: false, screening: "LOCAL_REGISTRY" }, evidence, adapters.planner, clock);
     return { ...result, evidence, fingerprint };

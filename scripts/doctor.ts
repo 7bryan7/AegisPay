@@ -29,6 +29,8 @@ if (!hasPlaceholder(process.env.DATABASE_URL)) {
     const client = new Client({ connectionString: process.env.DATABASE_URL, connectionTimeoutMillis: 5_000 });
     await client.connect();
     try {
+      await client.query("SELECT service_period,essential,verified_discount FROM ap_purchase_orders LIMIT 0");
+      await client.query("SELECT 1 FROM ap_invoice_revisions,ap_registry_revisions,ap_invoice_commands LIMIT 0");
       const result = await client.query("SELECT business_id FROM ap_treasuries WHERE business_id = $1", [process.env.BUSINESS_ID]);
       if (!result.rowCount) throw new Error("Treasury is not configured");
       workerHealthy=(await client.query(`SELECT 1 FROM ap_worker_status WHERE business_id=$1 AND healthy

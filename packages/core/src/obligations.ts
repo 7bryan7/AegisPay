@@ -1,4 +1,6 @@
 import { z } from "zod";
+import { isoCalendarDateSchema as dateOnlySchema } from "./dates.js";
+import { verifiedDiscountSchema } from "./discounts.js";
 import { formatMicroUsdc, microUsdcStringSchema, usdcToMicroUsdc } from "./amounts.js";
 
 export const ARC_CHAIN_ID = 5_042_002;
@@ -6,10 +8,7 @@ export const ARC_USDC_ADDRESS = "0x3600000000000000000000000000000000000000";
 export const arcAddressSchema = z.string().regex(/^0x[0-9a-fA-F]{40}$/)
   .refine((value) => !/^0x0{40}$/.test(value), "zero address is not a recipient")
   .transform((value) => value.toLowerCase());
-export const dateOnlySchema = z.string().regex(/^\d{4}-\d{2}-\d{2}$/).refine((value) => {
-  const time = Date.parse(`${value}T00:00:00.000Z`);
-  return value.slice(0, 4) !== "0000" && Number.isFinite(time) && new Date(time).toISOString().slice(0, 10) === value;
-}, "must be a real ISO calendar date");
+export { isoCalendarDateSchema as dateOnlySchema } from "./dates.js";
 
 const nonempty = z.string().trim().min(1).max(500);
 const version = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
@@ -18,11 +17,13 @@ const positiveAmount = microUsdcStringSchema.refine((value) => value !== "0", "a
 export const fieldEvidenceSchema = z.strictObject({
   id: nonempty,
   field: nonempty,
-  status: z.enum(["EXTRACTED", "MISSING", "AMBIGUOUS"]),
+  status: z.enum(["EXTRACTED", "MISSING", "AMBIGUOUS", "OPERATOR_VERIFIED"]),
   rawText: z.string().trim().min(1).max(4000).nullable(),
   sourceReference: z.string().trim().min(1).max(1000).nullable()
 }).refine((value) => value.status !== "EXTRACTED" || value.rawText !== null || value.sourceReference !== null,
-  "extracted facts require source evidence");
+  "extracted facts require source evidence")
+  .refine((value) => value.status !== "OPERATOR_VERIFIED" || value.sourceReference !== null,
+    "operator corrections require an independent evidence reference");
 
 export const payableVendorSchema = z.strictObject({
   businessId: nonempty, id: nonempty, name: nonempty, aliases: z.array(nonempty).max(50),
@@ -37,21 +38,13 @@ export const purchaseOrderSchema = z.strictObject({
   amountMicroUsdc: positiveAmount, outstandingMicroUsdc: microUsdcStringSchema,
   deliveryAccepted: z.boolean(), acceptanceReference: nonempty.nullable(),
   description: nonempty, dueDate: dateOnlySchema,
-  activeObligationId: nonempty.nullable()
+  activeObligationId: nonempty.nullable(),
+  servicePeriod: nonempty.nullable().optional(), essential: z.boolean().optional(), verifiedDiscount: verifiedDiscountSchema.nullable().optional()
 }).refine((value) => !microUsdcStringSchema.safeParse(value.outstandingMicroUsdc).success
   || !microUsdcStringSchema.safeParse(value.amountMicroUsdc).success
   || BigInt(value.outstandingMicroUsdc) <= BigInt(value.amountMicroUsdc),
   "outstanding amount exceeds authorized amount");
 
-/** Normalized facts are separate from raw extraction; missing data cannot parse as verified. */
-export const normalizedObligationSchema = z.strictObject({
-  businessId: nonempty, id: nonempty, version, vendorName: nonempty,
-  invoiceNumber: nonempty, purchaseOrderId: nonempty,
-  currency: z.enum(["USD", "USDC"]), issueDate: dateOnlySchema, dueDate: dateOnlySchema,
-  subtotalMicroUsdc: microUsdcStringSchema, taxMicroUsdc: microUsdcStringSchema,
-  amountMicroUsdc: positiveAmount, printedAddress: arcAddressSchema.nullable(),
-  evidence: z.array(fieldEvidenceSchema).min(1).max(100)
-});
 
 const extractedFieldSchema = z.strictObject({
   value: z.string().trim().min(1).max(4000).nullable(),
@@ -83,6 +76,21 @@ export const payableExtractionSchema = z.strictObject({
     amount: extractedFieldSchema
   })).max(200)
 });
+
+/** Normalized facts are separate from raw extraction; missing data cannot parse as verified. */
+export const normalizedObligationSchema = z.strictObject({
+  businessId: nonempty, id: nonempty, version, vendorName: nonempty,
+  invoiceNumber: nonempty, purchaseOrderId: nonempty,
+  currency: z.enum(["USD", "USDC"]), issueDate: dateOnlySchema, dueDate: dateOnlySchema,
+  subtotalMicroUsdc: microUsdcStringSchema, taxMicroUsdc: microUsdcStringSchema,
+  amountMicroUsdc: positiveAmount, printedAddress: arcAddressSchema.nullable(),
+  serviceDescription: z.string().trim().min(1).max(4000).nullable().optional(),
+  servicePeriod: z.string().trim().min(1).max(4000).nullable().optional(),
+  paymentTerms: z.string().trim().min(1).max(4000).nullable().optional(),
+  lineItems: payableExtractionSchema.shape.lineItems.optional(),
+  evidence: z.array(fieldEvidenceSchema).min(1).max(100)
+});
+
 
 export type PayableVendor = z.infer<typeof payableVendorSchema>;
 export type PurchaseOrder = z.infer<typeof purchaseOrderSchema>;
@@ -119,7 +127,11 @@ export function normalizePayableExtraction(
       dueDate: extraction.dueDate.value,
       subtotalMicroUsdc: amount("subtotal"), taxMicroUsdc: amount("tax"), amountMicroUsdc: amount("total"),
       printedAddress: extraction.printedAddress.status === "MISSING" ? null : extraction.printedAddress.value,
-      evidence: [...critical, ...(extraction.printedAddress.status === "EXTRACTED" ? ["printedAddress" as const] : [])].map((key) => ({
+      serviceDescription: extraction.serviceDescription.status === "EXTRACTED" ? extraction.serviceDescription.value : null,
+      servicePeriod: extraction.servicePeriod.status === "EXTRACTED" ? extraction.servicePeriod.value : null,
+      paymentTerms: extraction.paymentTerms.status === "EXTRACTED" ? extraction.paymentTerms.value : null,
+      lineItems: extraction.lineItems,
+      evidence: [...critical, ...(["serviceDescription", "servicePeriod", "paymentTerms"] as const).filter((key) => extraction[key].status === "EXTRACTED"), ...(extraction.printedAddress.status === "EXTRACTED" ? ["printedAddress" as const] : [])].map((key) => ({
         id: `source:${key}`, field: aliases[key] ?? key, status: extraction[key].status,
         rawText: extraction[key].sourceText, sourceReference: null
       }))
@@ -163,17 +175,26 @@ export function verifyObligation(
   if (invoice.purchaseOrderId !== po.id || po.vendorId !== vendor.id) reasons.push("PURCHASE_ORDER_MISMATCH");
   if (!po.deliveryAccepted || !po.acceptanceReference) reasons.push("DELIVERY_NOT_ACCEPTED");
   if (po.activeObligationId !== null && po.activeObligationId !== invoice.id) reasons.push("PURCHASE_ORDER_ALREADY_CLAIMED");
+  if (po.servicePeriod && (!invoice.servicePeriod || normalizedName(po.servicePeriod) !== normalizedName(invoice.servicePeriod))) reasons.push("SERVICE_PERIOD_MISMATCH");
   if (invoice.currency !== vendor.settlementCurrency) reasons.push("SETTLEMENT_AGREEMENT_MISMATCH");
   if (invoice.printedAddress !== null && invoice.printedAddress !== vendor.address) reasons.push("PRINTED_ADDRESS_MISMATCH");
   if (BigInt(invoice.subtotalMicroUsdc) + BigInt(invoice.taxMicroUsdc) !== BigInt(invoice.amountMicroUsdc)) reasons.push("ARITHMETIC_MISMATCH");
   if (invoice.amountMicroUsdc !== po.outstandingMicroUsdc || po.outstandingMicroUsdc !== po.amountMicroUsdc) reasons.push("FULL_PAYMENT_MISMATCH");
   if (invoice.issueDate > invoice.dueDate || invoice.dueDate !== po.dueDate) reasons.push("DATE_MISMATCH");
+  const lines = invoice.lineItems ?? [];
+  if (lines.length && lines.every((line) => line.amount.status === "EXTRACTED")) {
+    try {
+      const sum = lines.reduce((total, line) => total + usdcToMicroUsdc(line.amount.value ?? ""), 0n);
+      if (sum !== BigInt(invoice.subtotalMicroUsdc)) reasons.push("LINE_ITEM_SUBTOTAL_MISMATCH");
+    } catch { reasons.push("INVALID_LINE_ITEM_AMOUNT"); }
+  }
   const evidenceIds = invoice.evidence.map((item) => item.id);
   if (new Set(evidenceIds).size !== evidenceIds.length) reasons.push("DUPLICATE_EVIDENCE_ID");
-  if (invoice.evidence.some((item) => item.status !== "EXTRACTED")) reasons.push("UNCERTAIN_SOURCE_FACTS");
+  const verifiedEvidence = (item: z.infer<typeof fieldEvidenceSchema>) => item.status === "EXTRACTED" || item.status === "OPERATOR_VERIFIED";
+  if (invoice.evidence.some((item) => !verifiedEvidence(item))) reasons.push("UNCERTAIN_SOURCE_FACTS");
   for (const field of ["vendorName", "invoiceNumber", "purchaseOrderId", "currency", "issueDate", "dueDate", "subtotalMicroUsdc", "taxMicroUsdc", "amountMicroUsdc"]) {
-    if (!invoice.evidence.some((item) => item.field === field && item.status === "EXTRACTED")) reasons.push(`MISSING_SOURCE_${field}`);
+    if (!invoice.evidence.some((item) => item.field === field && verifiedEvidence(item))) reasons.push(`MISSING_SOURCE_${field}`);
   }
-  if (invoice.printedAddress !== null && !invoice.evidence.some((item) => item.field === "printedAddress" && item.status === "EXTRACTED")) reasons.push("MISSING_SOURCE_printedAddress");
+  if (invoice.printedAddress !== null && !invoice.evidence.some((item) => item.field === "printedAddress" && verifiedEvidence(item))) reasons.push("MISSING_SOURCE_printedAddress");
   return { status: reasons.length ? "HOLD" : "VERIFIED", reasons };
 }

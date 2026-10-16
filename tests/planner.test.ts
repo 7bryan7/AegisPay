@@ -59,6 +59,19 @@ describe("bounded payable planning", () => {
     } };
     expect((await planPayable(context(), malicious, () => now)).candidate?.amountMicroUsdc).toBe("1500000");
   });
+  it("offers only a verified exact discount, enforces caps on payout, and expires across a model call", async () => {
+    const input = context();
+    input.obligation.dueDate = input.purchaseOrder!.dueDate = "2026-11-09";
+    input.purchaseOrder!.verifiedDiscount = { discountedAmountMicroUsdc: "1200000", validThrough: "2026-10-09",
+      verifiedAt: "2026-10-08T00:00:00.000Z", verificationReference: "owner:discount", settlesInFull: true };
+    input.policy.hardTxMaxMicroUsdc = "1300000"; input.policy.autoPayMaxMicroUsdc = "1250000";
+    const discounted = { ...proposal, candidateId: "verified-discount", evidenceIds: [...proposal.evidenceIds, "verified-discount"] };
+    expect(await planPayable(input, planner(discounted), () => now)).toMatchObject({ action: "PAY_NOW", candidate: { amountMicroUsdc: "1200000" } });
+    expect((await planPayable(input, planner(proposal), () => now)).reasons).toContain("INVALID_PLANNER_PROPOSAL");
+    let time = new Date("2026-10-09T23:59:59.990Z"); input.snapshot.capturedAt = time.toISOString();
+    const slow = { modelId: "synthetic", propose: () => { time = new Date("2026-10-10T00:00:00.001Z"); return Promise.resolve(discounted); } };
+    expect((await planPayable(input, slow, () => time)).reasons).toEqual(["PLANNING_CONTEXT_EXPIRED"]);
+  });
   it("uses structured Gemini output without tools or signing access", async () => {
     const generate = vi.fn(() => Promise.resolve({ output: proposal })) as unknown as typeof generateText;
     const adapter = createGeminiPayablePlanner({ EXTRACTION_MODEL_API_KEY: "synthetic", EXTRACTION_MODEL_ID: "synthetic-model",

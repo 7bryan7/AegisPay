@@ -32,9 +32,9 @@ function fixture() {
 }
 describe("Circle transfer adapter", () => {
   it("preserves exact money/key and caps fees using decimal gwei", async () => {
-    const f = fixture();
-    expect(await f.adapter.submit(request)).toEqual({ providerId, providerState: "INITIATED" });
-    expect(f.client.createTransaction).toHaveBeenCalledExactlyOnceWith({ walletId, tokenAddress: ARC_USDC_ADDRESS,
+    const f = fixture(),requestId="00000000-0000-4000-8000-000000000005";
+    expect(await f.adapter.submit({...request,providerRequestId:requestId})).toEqual({ providerId, providerState: "INITIATED" });
+    expect(f.client.createTransaction).toHaveBeenCalledExactlyOnceWith({ walletAddress, blockchain:"ARC-TESTNET", tokenAddress: ARC_USDC_ADDRESS, xRequestId:requestId,
       amount: ["9007199254.740993"], destinationAddress: recipient, idempotencyKey: providerId,
       fee: { type: "absolute", config: { gasLimit: "21000", maxFee: "1.000000001", priorityFee: "0.100000000" } } });
     expect(f.client.getWallet).toHaveBeenCalledExactlyOnceWith({ id: walletId });
@@ -63,6 +63,22 @@ describe("Circle transfer adapter", () => {
     const f = fixture(); f.client.createTransaction.mockRejectedValue(new Error("private-url-key"));
     await expect(f.adapter.submit(request)).rejects.toMatchObject({ code: "CIRCLE_UNAVAILABLE", message: "CIRCLE_UNAVAILABLE" });
     expect(f.client.createTransaction).toHaveBeenCalledTimes(1);
+  });
+  it("retains bounded HTTP diagnostics and the persisted correlation ID without sensitive SDK fields", async () => {
+    const f=fixture(),requestId="00000000-0000-4000-8000-000000000005";
+    f.client.createTransaction.mockRejectedValue({status:400,code:2,message:"secret-key",url:"private-url",request:{entitySecretCiphertext:"private-ciphertext"}});
+    const error=await f.adapter.submit({...request,providerRequestId:requestId}).catch((error:unknown)=>error);
+    expect(error).toMatchObject({code:"CIRCLE_UNAVAILABLE",submissionIssue:{stage:"TRANSFER_REQUEST",httpStatus:400,providerCode:"2",requestId}});
+    expect(JSON.stringify(error)).not.toMatch(/secret-key|private-url|private-ciphertext/);
+    expect(f.client.createTransaction).toHaveBeenCalledTimes(1);
+    expect(f.client.createTransaction.mock.calls[0]?.[0]).toMatchObject({xRequestId:requestId,idempotencyKey:request.providerIdempotencyKey});
+  });
+  it("distinguishes wallet-check and invalid-response failures without claiming a failed transfer", async () => {
+    const f=fixture(); f.client.getWallet.mockRejectedValue({response:{status:503,data:{code:155001,message:"private"}}});
+    await expect(f.adapter.submit(request)).rejects.toMatchObject({submissionIssue:{stage:"WALLET_CHECK",httpStatus:503,providerCode:"155001"}});
+    expect(f.client.createTransaction).not.toHaveBeenCalled();
+    const other=fixture();other.client.createTransaction.mockResolvedValue({data:{private:"body"}});
+    await expect(other.adapter.submit(request)).rejects.toMatchObject({code:"CIRCLE_INVALID_RESPONSE",submissionIssue:{stage:"TRANSFER_RESPONSE",httpStatus:null,providerCode:null}});
   });
   it("copies money and fees before awaiting wallet verification", async () => {
     const f = fixture(), mutable = structuredClone(request);

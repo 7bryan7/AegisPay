@@ -1,3 +1,5 @@
+# AP API and continuously running worker. Apply migrations and enroll the treasury separately.
+# Frontend hosting remains configured in apps/web/vercel.json. No live dispatch by default.
 services:
   - type: web
     name: agentpay-api
@@ -10,60 +12,206 @@ services:
     healthCheckPath: /health
     envVars:
       - key: NODE_VERSION
-        value: 22.23.2
+        value: "22.23.2"
       - key: NODE_ENV
-        value: production
-      - key: WEB_ORIGIN
-        sync: false
-      - key: DATABASE_URL
-        sync: false
-      - key: ENS_RPC_URL
-        sync: false
-      - key: ENS_CHAIN_ID
-        value: "11155111"
-      - key: ENS_PARENT_NAME
-        value: agentpayapp.eth
-      - key: ENS_PROVIDER_NAMES
-        value: alpha.ocr.agentpayapp.eth
-      - key: HEDERA_NETWORK
-        value: hedera:testnet
-      - key: HEDERA_AGENT_ACCOUNT_ID
-        sync: false
-      - key: HEDERA_AGENT_PRIVATE_KEY
-        sync: false
-      - key: BLOCKY402_FACILITATOR_URL
-        value: https://api.testnet.blocky402.com
-      - key: PAYMENT_ASSET
-        value: 0.0.0
-      - key: ALPHA_RECIPIENT_ACCOUNT_ID
-        sync: false
-      - key: BETA_RECIPIENT_ACCOUNT_ID
-        sync: false
-      - key: ALPHA_PRICE_TINYBARS
-        value: "1000000"
-      - key: BETA_PRICE_TINYBARS
-        value: "2000000"
-      - key: PROVIDER_ALLOWED_ORIGINS
-        sync: false
+        value: "production"
+      - key: BUSINESS_ID
+        value: "local-business"
+      - key: PAYMENT_MODE
+        value: "disabled"
+      - key: PAYMENT_DISPATCH_ENABLED
+        value: "false"
       - key: EXTRACTION_MODEL_BASE_URL
-        value: https://generativelanguage.googleapis.com/v1beta
-      - key: EXTRACTION_MODEL_API_KEY
-        sync: false
-      - key: EXTRACTION_MODEL_ID
-        value: gemini-3.6-flash
-      - key: MAX_SPEND_PER_REQUEST_TINYBARS
-        value: "5000000"
-      - key: MAX_SPEND_PER_TASK_TINYBARS
-        value: "20000000"
-      - key: MAX_SPEND_PER_DAY_TINYBARS
-        value: "100000000"
+        value: "https://generativelanguage.googleapis.com/v1beta"
+      - key: CIRCLE_BLOCKCHAIN
+        value: "ARC-TESTNET"
+      - key: ARC_RPC_URL
+        value: "https://rpc.testnet.arc.io"
+      - key: ARC_CHAIN_ID
+        value: "5042002"
+      - key: ARC_USDC_ADDRESS
+        value: "0x3600000000000000000000000000000000000000"
+      - key: SCREENING_MODE
+        value: "local_registry"
+      - key: FEE_BUFFER_BPS
+        value: "2500"
+      - key: FEE_EXTRA_BUFFER_MICRO_USDC
+        value: "1000"
+      - key: WORKER_POLL_MS
+        value: "30000"
       - key: MAX_INPUT_BYTES
         value: "5000000"
       - key: MAX_INPUT_PIXELS
         value: "20000000"
-      - key: RESULT_RETENTION_HOURS
-        value: "24"
+      - key: INPUT_RETENTION_HOURS
+        value: "168"
+      - key: WEB_ORIGIN
+        sync: false
+      - key: DATABASE_URL
+        sync: false
       - key: DEMO_ACCESS_CODE
+        sync: false
+      - key: REVIEWER_ACCESS_CODE
+        sync: false
+      - key: EXTRACTION_MODEL_API_KEY
+        sync: false
+      - key: EXTRACTION_MODEL_ID
+        sync: false
+      - key: CIRCLE_API_KEY
+        sync: false
+      - key: CIRCLE_ENTITY_SECRET
+        sync: false
+      - key: CIRCLE_WALLET_ID
+        sync: false
+      - key: ARC_WALLET_ADDRESS
         sync: false
       - key: SESSION_SECRET
         generateValue: true
+  - type: worker
+    name: agentpay-worker
+    runtime: node
+    region: singapore
+    autoDeployTrigger: on
+    buildCommand: npm ci --include=dev && npm run build -w @agentpay/core && npm run build -w @agentpay/server
+    startCommand: npm run worker
+    envVars:
+      - key: NODE_VERSION
+        fromService:
+          name: agentpay-api
+          type: web
+          envVarKey: NODE_VERSION
+      - key: NODE_ENV
+        fromService:
+          name: agentpay-api
+          type: web
+          envVarKey: NODE_ENV
+      - key: BUSINESS_ID
+        fromService:
+          name: agentpay-api
+          type: web
+          envVarKey: BUSINESS_ID
+      - key: PAYMENT_MODE
+        fromService:
+          name: agentpay-api
+          type: web
+          envVarKey: PAYMENT_MODE
+      - key: PAYMENT_DISPATCH_ENABLED
+        fromService:
+          name: agentpay-api
+          type: web
+          envVarKey: PAYMENT_DISPATCH_ENABLED
+      - key: EXTRACTION_MODEL_BASE_URL
+        fromService:
+          name: agentpay-api
+          type: web
+          envVarKey: EXTRACTION_MODEL_BASE_URL
+      - key: CIRCLE_BLOCKCHAIN
+        fromService:
+          name: agentpay-api
+          type: web
+          envVarKey: CIRCLE_BLOCKCHAIN
+      - key: ARC_RPC_URL
+        fromService:
+          name: agentpay-api
+          type: web
+          envVarKey: ARC_RPC_URL
+      - key: ARC_CHAIN_ID
+        fromService:
+          name: agentpay-api
+          type: web
+          envVarKey: ARC_CHAIN_ID
+      - key: ARC_USDC_ADDRESS
+        fromService:
+          name: agentpay-api
+          type: web
+          envVarKey: ARC_USDC_ADDRESS
+      - key: SCREENING_MODE
+        fromService:
+          name: agentpay-api
+          type: web
+          envVarKey: SCREENING_MODE
+      - key: FEE_BUFFER_BPS
+        fromService:
+          name: agentpay-api
+          type: web
+          envVarKey: FEE_BUFFER_BPS
+      - key: FEE_EXTRA_BUFFER_MICRO_USDC
+        fromService:
+          name: agentpay-api
+          type: web
+          envVarKey: FEE_EXTRA_BUFFER_MICRO_USDC
+      - key: WORKER_POLL_MS
+        fromService:
+          name: agentpay-api
+          type: web
+          envVarKey: WORKER_POLL_MS
+      - key: MAX_INPUT_BYTES
+        fromService:
+          name: agentpay-api
+          type: web
+          envVarKey: MAX_INPUT_BYTES
+      - key: MAX_INPUT_PIXELS
+        fromService:
+          name: agentpay-api
+          type: web
+          envVarKey: MAX_INPUT_PIXELS
+      - key: INPUT_RETENTION_HOURS
+        fromService:
+          name: agentpay-api
+          type: web
+          envVarKey: INPUT_RETENTION_HOURS
+      - key: WEB_ORIGIN
+        fromService:
+          name: agentpay-api
+          type: web
+          envVarKey: WEB_ORIGIN
+      - key: DATABASE_URL
+        fromService:
+          name: agentpay-api
+          type: web
+          envVarKey: DATABASE_URL
+      - key: DEMO_ACCESS_CODE
+        fromService:
+          name: agentpay-api
+          type: web
+          envVarKey: DEMO_ACCESS_CODE
+      - key: REVIEWER_ACCESS_CODE
+        fromService:
+          name: agentpay-api
+          type: web
+          envVarKey: REVIEWER_ACCESS_CODE
+      - key: EXTRACTION_MODEL_API_KEY
+        fromService:
+          name: agentpay-api
+          type: web
+          envVarKey: EXTRACTION_MODEL_API_KEY
+      - key: EXTRACTION_MODEL_ID
+        fromService:
+          name: agentpay-api
+          type: web
+          envVarKey: EXTRACTION_MODEL_ID
+      - key: CIRCLE_API_KEY
+        fromService:
+          name: agentpay-api
+          type: web
+          envVarKey: CIRCLE_API_KEY
+      - key: CIRCLE_ENTITY_SECRET
+        fromService:
+          name: agentpay-api
+          type: web
+          envVarKey: CIRCLE_ENTITY_SECRET
+      - key: CIRCLE_WALLET_ID
+        fromService:
+          name: agentpay-api
+          type: web
+          envVarKey: CIRCLE_WALLET_ID
+      - key: ARC_WALLET_ADDRESS
+        fromService:
+          name: agentpay-api
+          type: web
+          envVarKey: ARC_WALLET_ADDRESS
+      - key: SESSION_SECRET
+        fromService:
+          name: agentpay-api
+          type: web
+          envVarKey: SESSION_SECRET

@@ -11,8 +11,16 @@ export const approvalTermsSchema = z.strictObject({
   purchaseOrderId: id, purchaseOrderVersion: version, policyVersion: version,
   recipient: arcAddressSchema,
   amountMicroUsdc: microUsdcStringSchema.refine((value) => value !== "0"),
+  nominalAmountMicroUsdc: microUsdcStringSchema.optional(), discountAdjustmentMicroUsdc: microUsdcStringSchema.optional(),
+  discountExpiresAt: z.iso.datetime().optional(), discountVerificationReference: id.optional(),
   chainId: z.literal(ARC_CHAIN_ID), token: z.literal(ARC_USDC_ADDRESS)
-});
+}).refine((terms) => {
+  const fields = [terms.nominalAmountMicroUsdc, terms.discountAdjustmentMicroUsdc, terms.discountExpiresAt, terms.discountVerificationReference];
+  if (fields.every((value) => value === undefined)) return true;
+  if (![terms.amountMicroUsdc, terms.discountAdjustmentMicroUsdc, terms.nominalAmountMicroUsdc].every((value) => microUsdcStringSchema.safeParse(value).success)) return false;
+  return fields.every((value) => value !== undefined) && BigInt(terms.discountAdjustmentMicroUsdc!) > 0n
+    && BigInt(terms.amountMicroUsdc) + BigInt(terms.discountAdjustmentMicroUsdc!) === BigInt(terms.nominalAmountMicroUsdc!);
+}, "Discount requires complete exact full-settlement terms");
 
 export const payableApprovalSchema = z.strictObject({
   id, terms: approvalTermsSchema, actorId: id, role: z.literal("OPERATOR"),

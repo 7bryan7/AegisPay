@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import type { Pool } from "pg";
-import { enrollmentSchema, type Enrollment } from "@agentpay/core";
+import { compareVerifiedDiscount, enrollmentSchema, type Enrollment } from "@agentpay/core";
 import { z } from "zod";
 
 const contextSchema = z.strictObject({
@@ -19,6 +19,9 @@ export function validateEnrollment(context: EnrollmentContext, raw: unknown): En
     throw new Error("ENROLLMENT_CONTEXT_MISMATCH");
   }
   if (manifest.vendors.some((vendor) => Date.parse(vendor.verifiedAt) > Date.now())) throw new Error("FUTURE_VERIFICATION_DATE");
+  for (const po of manifest.purchaseOrders) if (po.verifiedDiscount && compareVerifiedDiscount({
+    nominalAmountMicroUsdc: po.amountMicroUsdc, dueDate: po.dueDate, terms: po.verifiedDiscount,
+    now: new Date().toISOString() }).status === "INVALID") throw new Error("INVALID_DISCOUNT_TERMS");
   return manifest;
 }
 
@@ -72,16 +75,16 @@ export async function enrollPayables(pool: Pool, context: EnrollmentContext, raw
         'businessId',p.business_id,'id',p.id,'vendorId',p.vendor_id,'version',p.version,
         'amountMicroUsdc',p.amount_micro_usdc::text,'outstandingMicroUsdc',p.outstanding_micro_usdc::text,
         'deliveryAccepted',p.delivery_accepted,'acceptanceReference',p.acceptance_reference,'description',p.description,
-        'dueDate',p.due_date::text,'activeObligationId',NULL) AS terms
+        'dueDate',p.due_date::text,'servicePeriod',p.service_period,'essential',p.essential,'verifiedDiscount',p.verified_discount,'activeObligationId',NULL) AS terms
         FROM ap_purchase_orders p WHERE p.business_id = $1 AND p.id = $2 FOR UPDATE`, [businessId, po.id]);
       if (existing.rows[0]) {
         // A retry does not release an existing obligation claim; activeObligationId is never written here.
-        if (!isDeepStrictEqual(existing.rows[0].terms, po)) throw new EnrollmentConflict();
+        if (!isDeepStrictEqual(existing.rows[0].terms, { ...po, servicePeriod: po.servicePeriod ?? null, essential: po.essential ?? true, verifiedDiscount: po.verifiedDiscount ?? null })) throw new EnrollmentConflict();
       } else {
         await client.query(`INSERT INTO ap_purchase_orders (business_id,id,vendor_id,version,amount_micro_usdc,
-          outstanding_micro_usdc,description,due_date,delivery_accepted,acceptance_reference)
-          VALUES ($1,$2,$3,1,$4,$4,$5,$6,$7,$8)`,
-        [businessId,po.id,po.vendorId,po.amountMicroUsdc,po.description,po.dueDate,po.deliveryAccepted,po.acceptanceReference]);
+          outstanding_micro_usdc,description,due_date,delivery_accepted,acceptance_reference,essential,verified_discount,service_period)
+          VALUES ($1,$2,$3,1,$4,$4,$5,$6,$7,$8,$9,$10::jsonb,$11)`,
+        [businessId,po.id,po.vendorId,po.amountMicroUsdc,po.description,po.dueDate,po.deliveryAccepted,po.acceptanceReference,po.essential ?? true,po.verifiedDiscount ? JSON.stringify(po.verifiedDiscount) : null, po.servicePeriod ?? null]);
         inserted.purchaseOrders++;
       }
     }

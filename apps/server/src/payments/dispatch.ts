@@ -3,14 +3,14 @@ import type { Pool } from "pg";
 import { z } from "zod";
 import { approvalTermsSchema, arcAddressSchema, microUsdcStringSchema } from "@agentpay/core";
 import type { CircleExpectedTerms, CircleTransactionStatus, CircleTransferResult } from "./circle.js";
-import { createCircleTransferAdapter } from "./circle.js";
+import { createCircleTransferAdapter, CircleTransferError } from "./circle.js";
 import { authorizePayment, readPaymentEvidence, PaymentAuthorizationError } from "./authorization.js";
 import { reservationFingerprint } from "./reserve.js";
 import type { PlanningAdapters } from "../treasury/prepare.js";
 
 export type CircleTransferAdapter = { dispatchEnabled?: boolean; submit(request: unknown): Promise<CircleTransferResult> };
 export type CircleProvider = CircleTransferAdapter & { checkWallet(): Promise<void>; getStatus(providerId: string, expected?: CircleExpectedTerms): Promise<CircleTransactionStatus> };
-export const storedPaymentTermsSchema = approvalTermsSchema.extend({ walletAddress: arcAddressSchema, feeAllowanceMicroUsdc: microUsdcStringSchema,
+export const storedPaymentTermsSchema = approvalTermsSchema.safeExtend({ walletAddress: arcAddressSchema, feeAllowanceMicroUsdc: microUsdcStringSchema,
   fee: z.strictObject({ gasLimit: z.string().regex(/^[1-9]\d*$/), maxFeePerGasNative: z.string().regex(/^[1-9]\d*$/),
     maxPriorityFeePerGasNative: z.string().regex(/^(0|[1-9]\d*)$/) }), evidence: z.record(z.string(),z.unknown()) });
 type Intent = { id: string; obligation_id: string; decision_id: string; terms: unknown; provider_idempotency_key: string;
@@ -49,6 +49,7 @@ export async function dispatchNextPayment(pool: Pool, adapter: CircleTransferAda
   let fresh;
   try { fresh = await readPaymentEvidence(pool,businessId,terms.recipient,terms.amountMicroUsdc,evidenceReaders); }
   catch { return { status:"WAITING",intentId:row.id,reason:"FRESH_EVIDENCE_UNAVAILABLE" }; }
+  const providerRequestId=randomUUID();
   const leaseOwner = randomUUID(), client = await pool.connect();
   try {
     await client.query("BEGIN");
@@ -80,15 +81,19 @@ export async function dispatchNextPayment(pool: Pool, adapter: CircleTransferAda
       lease_expires_at=now()+interval '2 minutes' WHERE business_id=$1 AND id=$2`,[businessId,row.id,leaseOwner]);
     await client.query(`INSERT INTO ap_events (business_id,event_key,actor_id,entity_id,entity_version,event_type,payload)
       VALUES ($1,$2,'payment-worker',$3,$4,'PAYMENT_SUBMITTING',$5::jsonb)`,
-      [businessId,"submitting:"+row.id,row.obligation_id,terms.obligationVersion,JSON.stringify({intentId:row.id})]);
+      [businessId,"submitting:"+row.id,row.obligation_id,terms.obligationVersion,JSON.stringify({intentId:row.id,requestId:providerRequestId})]);
     await client.query("COMMIT");
   } catch(error) { await client.query("ROLLBACK"); throw error; } finally {client.release();}
   let response: CircleTransferResult | null = null;
+  let submissionIssue: CircleTransferError["submissionIssue"]=undefined;
   try {
     response = await adapter.submit({ walletId:terms.walletId,providerIdempotencyKey:row.provider_idempotency_key,
-      recipient:terms.recipient,amountMicroUsdc:terms.amountMicroUsdc,chainId:terms.chainId,tokenAddress:terms.token,
+      providerRequestId,recipient:terms.recipient,amountMicroUsdc:terms.amountMicroUsdc,chainId:terms.chainId,tokenAddress:terms.token,
       feeAllowanceMicroUsdc:terms.feeAllowanceMicroUsdc,fee:terms.fee });
-  } catch { /* Uncertainty retains the hold, including transport errors after acceptance. */ }
+  } catch(error) {
+    if(error instanceof CircleTransferError)submissionIssue=error.submissionIssue;
+    // All uncertain attempts retain their hold. A recorded HTTP code alone never authorizes replay.
+  }
   const persist = await pool.connect();
   try {
     await persist.query("BEGIN");
@@ -99,7 +104,7 @@ export async function dispatchNextPayment(pool: Pool, adapter: CircleTransferAda
     if (updated.rowCount !== 1) {await persist.query("ROLLBACK");return {status:"UNKNOWN",intentId:row.id,reason:"DISPATCH_LEASE_LOST"};}
     await persist.query(`INSERT INTO ap_events (business_id,event_key,actor_id,entity_id,entity_version,event_type,payload)
       VALUES ($1,$2,'payment-worker',$3,$4,$5,$6::jsonb)`,[businessId,"submitted:"+row.id,row.obligation_id,terms.obligationVersion,
-      response?"PAYMENT_PENDING":"PAYMENT_UNKNOWN",JSON.stringify({intentId:row.id,providerId:response?.providerId??null})]);
+      response?"PAYMENT_PENDING":"PAYMENT_UNKNOWN",JSON.stringify({intentId:row.id,providerId:response?.providerId??null,...(submissionIssue?{submissionIssue}:{})})]);
     await persist.query("COMMIT");
   } catch(error) {await persist.query("ROLLBACK");throw error;} finally {persist.release();}
   return response?{status:"PENDING",intentId:row.id,providerId:response.providerId,providerState:response.providerState}

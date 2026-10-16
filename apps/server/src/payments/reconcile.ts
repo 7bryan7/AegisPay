@@ -4,7 +4,9 @@ import { cashEvidenceSchema, paymentLedgerSchema, ARC_CHAIN_ID, ARC_USDC_ADDRESS
 import type { CircleExpectedTerms, CircleTransactionStatus } from "./circle.js";
 import { createArcCashReader } from "./arc.js";
 import { createArcReceiptReader } from "./arc-receipt.js";
-import { storedPaymentTermsSchema } from "./dispatch.js";
+import { storedPaymentTermsSchema, createCircleAdapterFromEnvironment } from "./dispatch.js";
+import { randomUUID } from "node:crypto";
+import { paymentReconciliationRequestSchema, type PaymentReconciliationResult } from "@agentpay/core";
 import { reservationFingerprint } from "./reserve.js";
 
 export type CircleStatusReader = { getStatus(providerId: string, expected?: CircleExpectedTerms): Promise<CircleTransactionStatus> };
@@ -42,7 +44,7 @@ async function finish(pool: Pool, intent: UnresolvedIntent, receipt: z.infer<typ
     if (success) {
       requireOne((await client.query(`UPDATE ap_purchase_orders SET outstanding_micro_usdc=outstanding_micro_usdc-$3::numeric
         WHERE business_id=$1 AND id=$2 AND outstanding_micro_usdc=$3::numeric`,
-        [intent.business_id,terms.purchaseOrderId,terms.amountMicroUsdc])).rowCount);
+        [intent.business_id,terms.purchaseOrderId,terms.nominalAmountMicroUsdc ?? terms.amountMicroUsdc])).rowCount);
       requireOne((await client.query("UPDATE ap_obligations SET status='SETTLED',next_evaluation_at=now() WHERE business_id=$1 AND id=$2 AND status='OPEN'",
         [intent.business_id,intent.obligation_id])).rowCount);
       if (current.approval_id) requireOne((await client.query("UPDATE ap_approvals SET consumed_at=now() WHERE business_id=$1 AND id=$2 AND consumed_at IS NULL",
@@ -67,10 +69,11 @@ async function finish(pool: Pool, intent: UnresolvedIntent, receipt: z.infer<typ
 
 /** A provider terminal result plus a fresh, independently matched finalized receipt is required. */
 export async function reconcileNextPayment(pool: Pool, circle: CircleStatusReader, cashReader: ArcCashReader,
-  receiptReader: ArcReceiptVerifier, businessId: string): Promise<ReconcileResult> {
+  receiptReader: ArcReceiptVerifier, businessId: string, expectedIntentId?: string): Promise<ReconcileResult> {
   const row = (await pool.query<UnresolvedIntent>(`SELECT i.business_id,i.id,i.obligation_id,i.provider_id,i.provider_state,
     i.terms,i.request_fingerprint,i.amount_micro_usdc::text FROM ap_payment_intents i
-    WHERE i.business_id=$1 AND i.state IN ('PENDING','UNKNOWN') ORDER BY i.created_at,i.id LIMIT 1`,[businessId])).rows[0];
+    WHERE i.business_id=$1 AND i.state IN ('PENDING','UNKNOWN') AND ($2::uuid IS NULL OR i.id=$2)
+    ORDER BY i.created_at,i.id LIMIT 1`,[businessId, expectedIntentId ?? null])).rows[0];
   if (!row) return {status:"NO_UNRESOLVED"};
   const waiting = (reason: string): ReconcileResult => ({status:"WAITING",intentId:row.id,reason});
   if (!row.provider_id) return waiting("PROVIDER_ID_UNAVAILABLE");
@@ -101,4 +104,24 @@ export async function reconcileNextPayment(pool: Pool, circle: CircleStatusReade
     if (!await finish(pool,row,receipt,success)) return waiting("SETTLEMENT_STATE_CHANGED");
     return success?{status:"SETTLED",intentId:row.id,transactionHash:receipt.transactionHash}:{status:"FAILED",intentId:row.id,providerState:"FAILED"};
   } catch { return waiting("ARC_RECEIPT_OR_SETTLEMENT_UNAVAILABLE"); }
+}
+
+export class PaymentReconciliationError extends Error {
+  constructor(readonly code: "NOT_FOUND" | "RECONCILIATION_UNAVAILABLE", readonly status: number) { super(code); }
+}
+/** An operator may reconcile exactly one existing intent, never create/send one. */
+export async function reconcilePaymentForOperator(pool: Pool, businessId: string, actorId: string, id: string, reason: string,
+  environment: NodeJS.ProcessEnv = process.env): Promise<PaymentReconciliationResult> {
+  paymentReconciliationRequestSchema.parse({ reason });
+  const row = (await pool.query<{ state: string; obligation_id: string }>(
+    "SELECT state,obligation_id FROM ap_payment_intents WHERE business_id=$1 AND id=$2", [businessId, id])).rows[0];
+  if (!row) throw new PaymentReconciliationError("NOT_FOUND", 404);
+  if (["FAILED", "CANCELLED", "SETTLED"].includes(row.state)) return { status: "UNCHANGED", intentId: id, state: row.state };
+  if (!["PENDING", "UNKNOWN"].includes(row.state)) return { status: "WAITING", intentId: id, reason: "SUBMISSION_NOT_RECONCILABLE" };
+  const circle = createCircleAdapterFromEnvironment(environment), arc = createArcReconciliationFromEnvironment(environment);
+  if (!circle || !arc) throw new PaymentReconciliationError("RECONCILIATION_UNAVAILABLE", 503);
+  await pool.query(`INSERT INTO ap_events (business_id,event_key,actor_id,entity_id,entity_version,event_type,payload)
+    SELECT business_id,$3,$4,id,version,'RECONCILIATION_REQUESTED',$5::jsonb FROM ap_obligations WHERE business_id=$1 AND id=$2`,
+    [businessId, row.obligation_id, `manual-reconcile:${randomUUID()}`, actorId, JSON.stringify({ intentId: id, reason })]);
+  return reconcileNextPayment(pool, circle, arc.cashReader, arc.receiptReader, businessId, id);
 }

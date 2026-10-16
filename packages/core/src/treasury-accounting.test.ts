@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { ARC_CHAIN_ID, ARC_USDC_ADDRESS } from "./obligations.js";
-import { accountTreasury, feeAllowanceFromEvidence, type PaymentLedgerEntry, type TreasuryAccountingInput } from "./treasury-accounting.js";
+import { accountTreasuryOverview, accountTreasury, feeAllowanceFromEvidence, type PaymentLedgerEntry, type TreasuryAccountingInput } from "./treasury-accounting.js";
 import { evaluateTreasury } from "./treasury.js";
 
 const wallet = `0x${"1".repeat(40)}`, recipient = `0x${"2".repeat(40)}`;
@@ -51,6 +51,23 @@ function reason(value: TreasuryAccountingInput) {
 }
 
 describe("treasury accounting", () => {
+  it("summarizes all commitments without an excluded candidate or invented future fee", () => {
+    const { candidate: _candidate, fee: _fee, ...value } = input(); void _candidate; void _fee;
+    value.commitments = [commitment(), commitment({ purchaseOrderId: "candidate-po", obligationId: "candidate", outstandingMicroUsdc: "1500000" })];
+    expect(accountTreasuryOverview({ ...value, category: "office" })).toMatchObject({ status: "READY", availableMicroUsdc: "10500000",
+      snapshot: { protectedObligationsMicroUsdc: "4500000", feeAllowanceMicroUsdc: "0" } });
+    value.commitments[0]!.essential = false;
+    expect(accountTreasuryOverview({ ...value, category: "office" })).toMatchObject({ status: "READY", availableMicroUsdc: "13500000" });
+    value.payments = [{ ...reserved(), state: "UNKNOWN" }];
+    expect(accountTreasuryOverview({ ...value, category: "office" })).toMatchObject({ status: "HOLD", reasons: ["CASH_INCLUSION_UNRESOLVED"] });
+  });
+  it("keeps a discounted hold bound to nominal commitments while cash and budgets use actual payout", () => {
+    const value = input(); value.payments = [{ ...reserved(), nominalAmountMicroUsdc: "2500000" }];
+    value.commitments = [commitment({ purchaseOrderId: "other-po", obligationId: "other", outstandingMicroUsdc: "2500000" })];
+    expect(ready(value)).toMatchObject({ totalHeldMicroUsdc: "2010000", snapshot: { protectedObligationsMicroUsdc: "0", dailyHoldsMicroUsdc: "2000000" } });
+    value.payments[0]!.nominalAmountMicroUsdc = "2500001";
+    expect(reason(value)).toEqual(["COMMITMENT_TERMS_MISMATCH"]);
+  });
   it("keeps fractional native fee dust held and rejects inconsistent rounded fees", () => {
     const value = input();
     value.payments = [{ ...reserved(), state: "PENDING", transactionHash, providerId: "provider-1", providerState: "PENDING",
@@ -119,6 +136,16 @@ describe("treasury accounting", () => {
     expect(ready(value).snapshot).toMatchObject({ dailySettledMicroUsdc: "0", unreflectedHoldsMicroUsdc: "0", hasInFlightTransfer: false });
     value.payments[0]!.receipt = null;
     expect(reason(value)).toEqual(["UNVERIFIED_FAILURE_FEE"]);
+  });
+  it("counts no hold, expenditure or receipt for a reviewed rejection before transaction creation",()=>{
+    const value=input(),payment:PaymentLedgerEntry={...reserved(),state:"FAILED",reservationState:"RELEASED",submissionRejection:{httpStatus:400,providerCode:2,providerRequestId:"a".repeat(32),requestedAt:"2026-10-01T12:00:01.000Z",reason:"TOKEN_ID_AND_BLOCKCHAIN_MISSING",evidenceReference:"reviewed:circle-log"}};
+    value.payments=[payment];
+    const result=ready(value);expect(result.snapshot).toMatchObject({dailySettledMicroUsdc:"0",dailyHoldsMicroUsdc:"0",categorySettledMicroUsdc:"0",unreflectedHoldsMicroUsdc:"0",hasInFlightTransfer:false});
+    expect(result.evidenceReferences).toContain("reviewed:circle-log");
+    value.payments=[{...payment,submissionRejection:null}];expect(reason(value)).toEqual(["UNVERIFIED_FAILURE_FEE"]);
+    for(const changed of [{providerId:"provider"},{providerState:"FAILED"},{transactionHash},{receipt:receipt()},{state:"UNKNOWN" as const,reservationState:"HELD" as const}]){
+      value.payments=[{...payment,...changed}];expect(reason(value)).toEqual(["INCONSISTENT_SUBMISSION_REJECTION"]);
+    }
   });
   it("keeps a reverted but unresolved payment held until terminal provider failure", () => {
     const value = input(); value.payments = [{ ...reserved(), state: "UNKNOWN", transactionHash,

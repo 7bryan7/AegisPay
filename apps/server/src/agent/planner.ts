@@ -35,6 +35,7 @@ export async function planPayable(raw: unknown, planner: PayablePlanner | null, 
   const eligibility = () => evaluateTreasury({ now: clock().toISOString(), dueDate: context.obligation.dueDate,
     amountMicroUsdc: context.obligation.amountMicroUsdc, verification: verification.status,
     duplicateOrSettled: context.duplicateOrSettled, exactApprovalValid: context.exactApprovalValid,
+    verifiedDiscount: context.purchaseOrder?.verifiedDiscount ?? null,
     screening: context.screening, policy: context.policy, snapshot: context.snapshot });
   const before = eligibility();
   if (!before.candidates.length) return { ...stop(before.reasons[0] ?? "NO_ELIGIBLE_CANDIDATE", before.action), reasons: before.reasons };

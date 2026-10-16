@@ -1,26 +1,47 @@
+import { payableVendorSchema, verifyObligation } from "@agentpay/core";
+import { createWorkspaceReads, type WorkspaceReads } from "./workspace.js";
+import { readTreasuryOverview } from "../treasury/view.js";
+import type { PlanningAdapters } from "../treasury/prepare.js";
+import type { TreasuryOverview } from "@agentpay/core";
 import type { Pool } from "pg";
-import { auditSchema, invoiceDetailSchema, invoiceListSchema, invoiceSummarySchema, microUsdcStringSchema,
+import { paymentAmounts, auditSchema, invoiceDetailSchema, invoiceListSchema, invoiceSummarySchema, microUsdcStringSchema,
   type AuditView, type InvoiceDetail, type InvoiceList, type TreasuryView } from "@agentpay/core";
+import type { InvoiceCorrection, InvoiceCommand, InvoiceEvaluation, InvoiceMutationResult, PaymentReconciliationResult } from "@agentpay/core";
+import { reconcilePaymentForOperator } from "../payments/reconcile.js";
+import { correctInvoice, evaluateInvoice, rejectInvoice } from "../obligations/review.js";
+import { readInvoiceRegistry, createAdministration, type Administration } from "./administration.js";
+import { readApprovalOffer } from "./approval-offer.js";
+import { reservationFingerprint } from "../payments/reserve.js";
+import { payableExtractionSchema } from "@agentpay/core";
 import { ingestObligation } from "../obligations/ingest.js";
+import { defaultInvoiceImageLimits, type InvoiceImageLimits } from "../extraction/image.js";
 import type { ApClaims } from "./session.js";
 
 export interface ApStore {
+  workspace?: WorkspaceReads;
+  administration?: Administration;
+  overview?(businessId: string, adapters: PlanningAdapters | null): Promise<TreasuryOverview>;
   ready(businessId: string): Promise<boolean>;
   list(businessId: string, offset: number): Promise<InvoiceList>;
   detail(businessId: string, id: string): Promise<InvoiceDetail | null>;
   audit(businessId: string, id: string): Promise<AuditView | null>;
   image(businessId: string, id: string): Promise<{ bytes: Buffer; mimeType: "image/png" | "image/jpeg" } | null>;
   treasury(businessId: string): Promise<Pick<TreasuryView, "walletAddress" | "paused" | "holdsMicroUsdc" | "minimumReserveMicroUsdc"> | null>;
-  setPaused(businessId: string, actorId: string, paused: boolean): Promise<void>;
+  setPaused(businessId: string, actorId: string, paused: boolean, reason?: string): Promise<void>;
   workerStatus(businessId: string): Promise<{ extractionAvailable: boolean; paymentAvailable: boolean; dispatchEnabled: boolean } | null>;
   upload(claims: ApClaims, key: string, hint: string | null, bytes: Buffer, mime: string): Promise<{ obligationId: string; status: string; reused: boolean }>;
-  approve(businessId: string, actorId: string, id: string, decisionId: string, reason: string): Promise<{ approvalId: string; expiresAt: string }>;
+  approve(businessId: string, actorId: string, id: string, decisionId: string, reason: string,
+    confirmation?: { expectedVersion: number; termsHash: string }): Promise<{ approvalId: string; expiresAt: string }>;
+  correct(businessId: string, actorId: string, id: string, input: InvoiceCorrection): Promise<InvoiceMutationResult>;
+  evaluate(businessId: string, actorId: string, id: string, input: InvoiceEvaluation): Promise<InvoiceMutationResult>;
+  reject(businessId: string, actorId: string, id: string, input: InvoiceCommand): Promise<InvoiceMutationResult>;
+  reconcile(businessId: string, actorId: string, id: string, reason: string): Promise<PaymentReconciliationResult>;
 }
 
 type InvoiceRow = {
   id: string; status: string; version: number; invoice_number: string | null; vendor_name: string | null;
   amount: string | null; due_date: string | null; created_at: Date; action: string | null; payment_state: string | null;
-  normalized: unknown; decision_view: unknown; payment_view: unknown;
+  normalized: unknown; decision_view: unknown; payment_view: unknown; original_extraction: unknown; raw_extraction: unknown; owner_corrections: unknown;
 };
 export class ApprovalConflict extends Error {
   constructor(readonly code: "APPROVAL_NOT_ELIGIBLE" | "APPROVAL_ALREADY_EXISTS") {
@@ -28,20 +49,29 @@ export class ApprovalConflict extends Error {
     this.name = "ApprovalConflict";
   }
 }
-const invoiceSelect = `SELECT o.id, o.status, o.version, o.normalized_invoice_number AS invoice_number,
+const decisionViewSql = `jsonb_build_object('id', d.id, 'action', d.action, 'reason', d.reason, 'evidenceIds', d.evidence_ids,
+  'evaluatedAt',to_char(d.evaluated_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),
+  'expiresAt',to_char(d.expires_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),
+  'versions',jsonb_build_object('invoice',d.obligation_version,'policy',d.policy_version,'vendor',d.vendor_address_version,'purchaseOrder',d.purchase_order_version),
+  'candidate',d.candidate,'treasury',jsonb_build_object('available',false)||d.treasury_snapshot,
+  'nextEvaluationAt',(SELECT payload->>'nextEvaluationAt' FROM ap_events WHERE business_id=d.business_id AND event_key='evaluated:'||d.id::text),
+  'alternativeConsidered',(SELECT payload->'proposal'->>'alternativeConsidered' FROM ap_events WHERE business_id=d.business_id AND event_key='evaluated:'||d.id::text),
+  'similarInvoiceIds',COALESCE((SELECT payload->'similarInvoiceIds' FROM ap_events WHERE business_id=d.business_id AND event_key='evaluated:'||d.id::text),'[]'::jsonb))`;
+const invoiceSelect = `SELECT o.id, o.status, o.version, o.normalized_invoice_number AS invoice_number,o.original_extraction,o.raw_extraction,o.owner_corrections,
   v.name AS vendor_name, o.amount_micro_usdc::text AS amount, o.due_date::text, o.created_at, o.normalized,
   d.action, p.state AS payment_state,
-  CASE WHEN d.id IS NULL THEN NULL ELSE jsonb_build_object('id', d.id, 'action', d.action,
-    'reason', d.reason, 'evidenceIds', d.evidence_ids,
-    'evaluatedAt', to_char(d.evaluated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')) END AS decision_view,
-  CASE WHEN p.id IS NULL THEN NULL ELSE jsonb_build_object('state', p.state, 'providerId', p.provider_id,
+  CASE WHEN d.id IS NULL THEN NULL ELSE ${decisionViewSql} END AS decision_view,
+  CASE WHEN p.id IS NULL THEN NULL ELSE jsonb_build_object('id',p.id,'state', p.state, 'providerId', p.provider_id,
+    'submissionIssue',(SELECT payload->'submissionIssue' FROM ap_events WHERE business_id=p.business_id AND event_key='submitted:'||p.id::text),
     'providerState', p.provider_state, 'transactionHash', p.transaction_hash,
     'settledAt', to_char(p.settled_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),
     'actualFeeMicroUsdc', p.actual_fee_micro_usdc::text,
+    'payoutAmountMicroUsdc',p.amount_micro_usdc::text,'nominalAmountMicroUsdc',COALESCE(p.terms->>'nominalAmountMicroUsdc',p.amount_micro_usdc::text),
+    'discountAdjustmentMicroUsdc',COALESCE(p.terms->>'discountAdjustmentMicroUsdc','0'),
     'verificationReference', p.receipt_evidence->>'verificationReference') END AS payment_view
   FROM ap_obligations o LEFT JOIN ap_vendors v ON v.business_id = o.business_id AND v.id = o.vendor_id
   LEFT JOIN LATERAL (SELECT * FROM ap_decisions WHERE business_id = o.business_id AND obligation_id = o.id
-    ORDER BY evaluated_at DESC, id DESC LIMIT 1) d ON true
+    AND obligation_version=o.version ORDER BY evaluated_at DESC, id DESC LIMIT 1) d ON true
   LEFT JOIN LATERAL (SELECT * FROM ap_payment_intents WHERE business_id = o.business_id AND obligation_id = o.id
     ORDER BY created_at DESC, id DESC LIMIT 1) p ON true`;
 function summary(row: InvoiceRow) {
@@ -50,9 +80,18 @@ function summary(row: InvoiceRow) {
     dueDate: row.due_date, createdAt: row.created_at.toISOString(), decision: row.action, paymentState: row.payment_state });
 }
 
-export function createApStore(pool: Pool, retentionHours: number): ApStore {
+export function createApStore(pool: Pool, retentionHours: number, limits: InvoiceImageLimits = defaultInvoiceImageLimits): ApStore {
   return {
+    administration: createAdministration(pool),
+    workspace: createWorkspaceReads(pool),
+    overview: (businessId, adapters) => readTreasuryOverview(pool, businessId, adapters),
+    reconcile: (businessId, actorId, id, reason) => reconcilePaymentForOperator(pool, businessId, actorId, id, reason),
+    correct: (businessId, actorId, id, input) => correctInvoice(pool, { businessId, actorId }, id, input),
+    evaluate: (businessId, actorId, id, input) => evaluateInvoice(pool, { businessId, actorId }, id, input),
+    reject: (businessId, actorId, id, input) => rejectInvoice(pool, { businessId, actorId }, id, input),
     async ready(businessId) {
+      await pool.query("SELECT service_period,essential,verified_discount FROM ap_purchase_orders LIMIT 0");
+      await pool.query("SELECT 1 FROM ap_invoice_revisions,ap_registry_revisions,ap_invoice_commands LIMIT 0");
       const result = await pool.query("SELECT business_id FROM ap_treasuries WHERE business_id = $1", [businessId]);
       return result.rowCount === 1;
     },
@@ -64,7 +103,24 @@ export function createApStore(pool: Pool, retentionHours: number): ApStore {
       const result = await pool.query<InvoiceRow>(`${invoiceSelect} WHERE o.business_id = $1 AND o.id = $2`, [businessId, id]);
       const row = result.rows[0];
       if (!row) return null;
-      return invoiceDetailSchema.parse({ invoice: summary(row), facts: row.normalized, decision: row.decision_view, payment: row.payment_view,
+      const revisions = (await pool.query<{ version: number; actor_id: string; action: string; reason: string; created_at: Date }>(
+        "SELECT version,actor_id,action,reason,created_at FROM ap_invoice_revisions WHERE business_id=$1 AND obligation_id=$2 ORDER BY version DESC LIMIT 100", [businessId, id])).rows;
+      const source = payableExtractionSchema.safeParse(row.original_extraction), latest = payableExtractionSchema.safeParse(row.raw_extraction);
+      const registry = await readInvoiceRegistry(pool,businessId,id);
+      const vendor = registry.vendor ? payableVendorSchema.strip().parse(registry.vendor) : null;
+      const metadata = (await pool.query<{sha256:string; mime_type:"image/png"|"image/jpeg"|null; byte_size:number|null; uploaded_by:string|null}>(`
+        SELECT o.input_sha256 AS sha256,i.mime_type,i.byte_size,
+          (SELECT actor_id FROM ap_events WHERE business_id=o.business_id AND entity_id=o.id::text
+            AND event_type='INVOICE_RECEIVED' ORDER BY created_at,event_key LIMIT 1) AS uploaded_by
+        FROM ap_obligations o LEFT JOIN ap_inputs i ON i.business_id=o.business_id AND i.obligation_id=o.id
+        WHERE o.business_id=$1 AND o.id=$2`,[businessId,id])).rows[0]!;
+      return invoiceDetailSchema.parse({ registry,
+        source: {sha256:metadata.sha256,mimeType:metadata.mime_type,byteSize:metadata.byte_size,retained:metadata.byte_size!==null,uploadedBy:metadata.uploaded_by},
+        verification: verifyObligation(row.normalized,vendor,registry.purchaseOrder), invoice: summary(row), facts: row.normalized, decision: row.decision_view, payment: row.payment_view,
+        approvalOffer: await readApprovalOffer(pool, businessId, id, row.version),
+        review: { originalExtraction: source.success ? source.data : null, latestExtraction: latest.success ? latest.data : null,
+          corrections: row.owner_corrections, revisions: revisions.map((revision) => ({ version: revision.version, actorId: revision.actor_id,
+            action: revision.action, reason: revision.reason, createdAt: revision.created_at.toISOString() })) },
         processingMessage: row.status === "RECEIVED" || row.status === "EXTRACTING"
           ? "Image saved and queued for extraction. Processing requires the configured extraction worker. No payment has been initiated by this upload."
           : "Stored evaluation decision. Scheduling rechecks funding when due; only a settled payment with receipt evidence confirms payment." });
@@ -72,11 +128,27 @@ export function createApStore(pool: Pool, retentionHours: number): ApStore {
     async audit(businessId, id) {
       const invoice=(await pool.query<InvoiceRow>(`${invoiceSelect} WHERE o.business_id=$1 AND o.id=$2`,[businessId,id])).rows[0];
       if (!invoice) return null;
-      // Deliberate allowlist: never export raw payloads, model output, credentials or images.
-      const result = await pool.query<{ event_key: string; event_type: string; entity_version: number; created_at: Date }>(
-        "SELECT event_key, event_type, entity_version, created_at FROM ap_events WHERE business_id = $1 AND entity_id = $2 ORDER BY created_at, event_key LIMIT 500", [businessId, id]);
-      return auditSchema.parse({ decision:invoice.decision_view,payment:invoice.payment_view,
-        events: result.rows.map((row) => ({ key: row.event_key, type: row.event_type, version: row.entity_version, createdAt: row.created_at.toISOString() })) });
+      // Explicit typed projections; never export source images, raw model payloads,
+      // provider responses, signing configuration or arbitrary event JSON.
+      const [events, decisions, approvals, corrections] = await Promise.all([
+        pool.query<{ event_key: string; event_type: string; entity_version: number; created_at: Date; actor_id: string; reason: string | null }>(
+          "SELECT event_key,event_type,entity_version,created_at,actor_id,payload->>'reason' AS reason FROM ap_events WHERE business_id=$1 AND entity_id=$2 ORDER BY created_at,event_key LIMIT 501", [businessId,id]),
+        pool.query<{ data: unknown }>(`SELECT ${decisionViewSql} AS data FROM ap_decisions d WHERE business_id=$1 AND obligation_id=$2 ORDER BY evaluated_at,id LIMIT 501`, [businessId,id]),
+        pool.query<{ data: unknown }>(`SELECT jsonb_build_object('id',id,'terms',terms,'actorId',actor_id,'role',role,'granted',granted,'reason',reason,
+          'grantedAt',to_char(granted_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),
+          'expiresAt',to_char(expires_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),
+          'consumedAt',to_char(consumed_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')) AS data
+          FROM ap_approvals WHERE business_id=$1 AND obligation_id=$2 ORDER BY granted_at,id LIMIT 501`, [businessId,id]),
+        pool.query<{ data: unknown }>(`SELECT jsonb_build_object('version',version,'actorId',actor_id,'action',action,'reason',reason,
+          'createdAt',to_char(created_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),'fields',corrections) AS data
+          FROM ap_invoice_revisions WHERE business_id=$1 AND obligation_id=$2 ORDER BY version LIMIT 501`, [businessId,id])
+      ]);
+      return auditSchema.parse({ invoice: summary(invoice), facts: invoice.normalized, decision:invoice.decision_view,payment:invoice.payment_view,
+        decisions: decisions.rows.slice(0,500).map((row) => row.data), approvals: approvals.rows.slice(0,500).map((row) => row.data),
+        corrections: corrections.rows.slice(0,500).map((row) => row.data),
+        truncated: [events,decisions,approvals,corrections].some((result) => result.rows.length > 500),
+        events: events.rows.slice(0,500).map((row) => ({ key:row.event_key,type:row.event_type,version:row.entity_version,
+          createdAt:row.created_at.toISOString(),actorId:row.actor_id,reason:row.reason })) });
     },
     async image(businessId, id) {
       const result = await pool.query<{ image_bytes: Buffer; mime_type: "image/png" | "image/jpeg" }>(
@@ -100,7 +172,7 @@ export function createApStore(pool: Pool, retentionHours: number): ApStore {
         "SELECT extraction_available,payment_available,dispatch_enabled FROM ap_worker_status WHERE business_id=$1 AND healthy AND updated_at>now()-interval '90 seconds'",[businessId])).rows[0];
       return row?{extractionAvailable:row.extraction_available,paymentAvailable:row.payment_available,dispatchEnabled:row.dispatch_enabled}:null;
     },
-    async setPaused(businessId, actorId, paused) {
+    async setPaused(businessId, actorId, paused, reason = paused ? "Operator paused new payments" : "Operator resumed policy-controlled payments") {
       const client = await pool.connect();
       try {
         await client.query("BEGIN");
@@ -109,16 +181,16 @@ export function createApStore(pool: Pool, retentionHours: number): ApStore {
         const { randomUUID } = await import("node:crypto");
         await client.query(`INSERT INTO ap_events (business_id,event_key,actor_id,entity_id,entity_version,event_type,payload)
           VALUES ($1,$2,$3,$1,$4,'TREASURY_PAUSE_CHANGED',$5::jsonb)`,
-          [businessId,"pause:"+randomUUID(),actorId,updated.rows[0]!.policy_version,JSON.stringify({paused,reason:paused?"Operator paused new payments":"Operator resumed policy-controlled payments"})]);
+          [businessId,"pause:"+randomUUID(),actorId,updated.rows[0]!.policy_version,JSON.stringify({paused,reason})]);
         await client.query("COMMIT");
       } catch(error) { await client.query("ROLLBACK"); throw error; } finally { client.release(); }
     },
     async upload(claims, key, hint, bytes, mime) {
       if (claims.role !== "OPERATOR") throw new Error("OPERATOR_REQUIRED");
       return ingestObligation(pool, { businessId: claims.businessId, actorId: claims.actorId, role: "OPERATOR",
-        idempotencyKey: key, purchaseOrderHint: hint }, bytes, mime, retentionHours);
+        idempotencyKey: key, purchaseOrderHint: hint }, bytes, mime, retentionHours, limits);
     }
-    , async approve(businessId, actorId, id, decisionId, reason) {
+    , async approve(businessId, actorId, id, decisionId, reason, confirmation) {
       const client = await pool.connect();
       try {
         await client.query("BEGIN");
@@ -127,11 +199,12 @@ export function createApStore(pool: Pool, retentionHours: number): ApStore {
           obligation_version: number; decision_id: string; action: string; policy_version: number;
           vendor_id: string; vendor_address: string; vendor_address_version: number;
           purchase_order_id: string; purchase_order_version: number; amount: string;
+          planned_amount: string | null; due_date: string; verified_discount: unknown; policy: { annualCashPreservationCostBps?: number };
           wallet_id: string; chain_id: number; token_address: string; decision_expires_at: Date;
         }>(`SELECT o.version AS obligation_version, d.id AS decision_id, d.action, d.policy_version,
           o.vendor_id, v.address AS vendor_address, v.address_version AS vendor_address_version,
           o.purchase_order_id, po.version AS purchase_order_version, o.amount_micro_usdc::text AS amount,
-          t.wallet_id, t.chain_id, t.token_address, d.evaluated_at + interval '24 hours' AS decision_expires_at
+          o.due_date::text,po.verified_discount,t.policy,d.treasury_snapshot->'fee'->>'amountMicroUsdc' AS planned_amount,t.wallet_id, t.chain_id, t.token_address, d.evaluated_at + interval '24 hours' AS decision_expires_at
           FROM ap_obligations o
           JOIN ap_decisions d ON d.business_id = o.business_id AND d.obligation_id = o.id
           JOIN ap_vendors v ON v.business_id = o.business_id AND v.id = o.vendor_id
@@ -147,17 +220,26 @@ export function createApStore(pool: Pool, retentionHours: number): ApStore {
           ORDER BY d.evaluated_at DESC FOR UPDATE OF o, v, po`, [businessId, id, decisionId]);
         const row = result.rows[0];
         if (!row || row.decision_id !== decisionId || row.action !== "REQUIRE_APPROVAL" || row.decision_expires_at <= new Date()) throw new ApprovalConflict("APPROVAL_NOT_ELIGIBLE");
+        if ((await client.query("SELECT 1 FROM ap_approvals WHERE business_id=$1 AND decision_id=$2", [businessId, decisionId])).rowCount)
+          throw new ApprovalConflict("APPROVAL_ALREADY_EXISTS");
         const now = new Date();
-        const expiresAt = new Date(now.getTime() + 24 * 60 * 60 * 1000);
+        let expiresAt = new Date(now.getTime() + 24 * 60 * 60 * 1000);
+        let amounts;
+        try { amounts = paymentAmounts(row.amount, row.due_date, row.verified_discount, now.toISOString(), row.policy.annualCashPreservationCostBps); }
+        catch { throw new ApprovalConflict("APPROVAL_NOT_ELIGIBLE"); }
+        if (row.planned_amount !== amounts.amountMicroUsdc) throw new ApprovalConflict("APPROVAL_NOT_ELIGIBLE");
+        if (amounts.discountExpiresAt) expiresAt = new Date(Math.min(expiresAt.getTime(), Date.parse(amounts.discountExpiresAt)));
         const terms = { businessId, obligationId: id, decisionId, walletId: row.wallet_id,
           obligationVersion: row.obligation_version, vendorId: row.vendor_id,
           vendorAddressVersion: row.vendor_address_version, purchaseOrderId: row.purchase_order_id,
           purchaseOrderVersion: row.purchase_order_version, policyVersion: row.policy_version,
-          recipient: row.vendor_address, amountMicroUsdc: row.amount, chainId: row.chain_id,
+          recipient: row.vendor_address, ...amounts, chainId: row.chain_id,
           token: row.token_address };
-        const { createHash, randomUUID } = await import("node:crypto");
+        const { randomUUID } = await import("node:crypto");
         const approvalId = randomUUID();
-        const termsHash = createHash("sha256").update(JSON.stringify(terms)).digest("hex");
+        const termsHash = reservationFingerprint(terms);
+        if (confirmation && (confirmation.expectedVersion !== row.obligation_version || confirmation.termsHash !== termsHash))
+          throw new ApprovalConflict("APPROVAL_NOT_ELIGIBLE");
         await client.query(`INSERT INTO ap_approvals
           (business_id, id, obligation_id, decision_id, terms, terms_hash, actor_id, role, granted, reason, granted_at, expires_at)
           VALUES ($1,$2,$3,$4,$5::jsonb,$6,$7,'OPERATOR',true,$8,$9,$10)`,

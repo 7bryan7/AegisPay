@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { Pool } from "pg";
 import { z } from "zod";
-import { validateInvoiceImage } from "../extraction/image.js";
+import { defaultInvoiceImageLimits, validateInvoiceImage, type InvoiceImageLimits } from "../extraction/image.js";
 
 const metadataSchema = z.strictObject({
   // These claims must come from authenticated server context, not upload fields.
@@ -30,11 +30,12 @@ export async function ingestObligation(
   metadata: z.input<typeof metadataSchema>,
   bytes: Buffer,
   contentType: string,
-  retentionHours = 168
+  retentionHours = 168,
+  limits: InvoiceImageLimits = defaultInvoiceImageLimits
 ): Promise<{ obligationId: string; status: string; reused: boolean }> {
   const input = metadataSchema.parse(metadata);
   z.number().int().min(1).max(8760).parse(retentionHours);
-  const image = validateInvoiceImage(bytes, contentType, { maxBytes: 5_000_000, maxPixels: 20_000_000 });
+  const image = validateInvoiceImage(bytes, contentType, limits);
   const hash = createHash("sha256").update(image.bytes).digest("hex");
   const fingerprint = createHash("sha256").update(JSON.stringify({
     hash, mimeType: image.mimeType, purchaseOrderHint: input.purchaseOrderHint

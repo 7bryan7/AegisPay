@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "ENSv2-discovered invoice extraction paid through Blocky402 on Hedera Testnet",
+  "description": "Verified accounts payable and USDC treasury workflow on Arc Testnet",
   "license": "MIT",
   "engines": {
     "node": ">=22 <23",
@@ -15,12 +15,19 @@
     "packages/*"
   ],
   "scripts": {
+    "predev": "npm run build -w @agentpay/core",
+    "predemo": "npm run build -w @agentpay/core",
+    "demo": "node --import tsx scripts/demo.ts",
     "build": "npm run build -w @agentpay/core && npm run build -w @agentpay/server && npm run build -w @agentpay/web",
     "dev": "concurrently -k -n server,web -c blue,green \"npm run dev -w @agentpay/server\" \"npm run dev -w @agentpay/web\"",
     "start": "concurrently -k -n server,web \"npm run start -w @agentpay/server\" \"npm run start -w @agentpay/web\"",
     "lint": "eslint .",
     "typecheck": "npm run typecheck -w @agentpay/core && npm run build -w @agentpay/core && npm run typecheck -w @agentpay/server && npm run typecheck -w @agentpay/web && tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
+    "pretest": "npm run build -w @agentpay/core",
+    "pretest:e2e": "npm run build -w @agentpay/core",
+    "pretest:postgres": "npm run build -w @agentpay/core",
+    "test:db": "node --import tsx scripts/test-database.ts",
     "test:postgres": "vitest run --config vitest.postgres.config.ts",
     "test:e2e": "playwright test",
     "doctor": "node --import tsx scripts/doctor.ts",
@@ -32,16 +39,20 @@
     "ens:verify": "node --import tsx scripts/ens-verify.ts",
     "directory:add": "node --import tsx scripts/directory-add.ts",
     "recover:paid-extraction": "node --import tsx scripts/recover-paid-extraction.ts",
-    "smoke:testnet": "node --import tsx scripts/smoke-testnet.ts"
+    "smoke:testnet": "node --import tsx scripts/smoke-testnet.ts",
+    "test:e2e:db": "node --import tsx scripts/test-database.ts --browser",
+    "pretest:e2e:postgres": "npm run build -w @agentpay/core",
+    "test:e2e:postgres": "playwright test --config playwright.postgres.config.ts",
+    "evidence:source": "node --import tsx scripts/source-evidence.ts"
   },
   "devDependencies": {
     "@eslint/js": "10.0.1",
     "@playwright/test": "1.63.0",
     "@types/node": "22.20.2",
     "@types/pg": "8.23.1",
-    "concurrently": "10.0.5",
-    "eslint": "10.10.0",
+    "concurrently": "10.0.6",
     "dotenv": "17.4.2",
+    "eslint": "10.10.0",
     "globals": "17.12.0",
     "pg": "8.23.0",
     "tsx": "4.23.13",
@@ -49,5 +60,9 @@
     "typescript-eslint": "8.70.0",
     "viem": "2.56.3",
     "vitest": "5.0.0"
+  },
+  "overrides": {
+    "@hiero-ledger/sdk": "2.90.1",
+    "@hiero-ledger/proto": "2.32.0"
   }
 }

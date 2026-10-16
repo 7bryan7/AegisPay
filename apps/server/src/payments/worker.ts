@@ -25,7 +25,7 @@ export async function reserveNextPayment(pool: Pool, businessId: string, now = n
   const result = await pool.query<DueDecision>(`SELECT o.id AS obligation_id, d.id AS decision_id, d.treasury_snapshot
     FROM ap_obligations o
     JOIN LATERAL (SELECT id, action, candidate, treasury_snapshot, expires_at
-      FROM ap_decisions WHERE business_id = o.business_id AND obligation_id = o.id
+      FROM ap_decisions WHERE business_id = o.business_id AND obligation_id = o.id AND obligation_version=o.version
       ORDER BY evaluated_at DESC, id DESC LIMIT 1) d ON true
     WHERE o.business_id = $1 AND o.status = 'OPEN' AND o.next_evaluation_at <= $2
       AND d.action IN ('PAY_NOW', 'SCHEDULE', 'REQUIRE_APPROVAL') AND (d.expires_at > $2 OR d.action='REQUIRE_APPROVAL')

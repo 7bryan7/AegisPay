@@ -1,6 +1,8 @@
 import { imageSize } from "image-size";
 
 export type SupportedInvoiceMimeType = "image/png" | "image/jpeg";
+export interface InvoiceImageLimits { maxBytes: number; maxPixels: number }
+export const defaultInvoiceImageLimits: InvoiceImageLimits = { maxBytes: 5_000_000, maxPixels: 20_000_000 };
 
 export interface ValidatedInvoiceImage {
   bytes: Uint8Array;

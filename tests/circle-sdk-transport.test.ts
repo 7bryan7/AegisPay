@@ -19,7 +19,8 @@ it("encodes exact persisted terms through the installed Circle SDK HTTP transpor
     const body=raw?JSON.parse(raw) as Record<string,unknown>:{};
     calls.push({method:req.method??"",path:req.url??"",body});
     res.setHeader("content-type","application/json");
-    if(req.url?.endsWith("/config/entity/publicKey")) res.end(JSON.stringify({data:{publicKey:publicKey.export({type:"spki",format:"pem"})}}));
+    if(req.url?.endsWith("/developer/transactions/transfer")&&(body.walletId!==undefined||body.walletAddress!==walletAddress||body.blockchain!=="ARC-TESTNET")){res.statusCode=400;res.end(JSON.stringify({code:2,message:"Invalid wallet or token identification"}));}
+    else if(req.url?.endsWith("/config/entity/publicKey")) res.end(JSON.stringify({data:{publicKey:publicKey.export({type:"spki",format:"pem"})}}));
     else if(req.url?.endsWith(`/wallets/${walletId}`)) res.end(JSON.stringify({data:{wallet:{id:walletId,address:walletAddress,blockchain:"ARC-TESTNET",accountType:"EOA",custodyType:"DEVELOPER",state:"LIVE"}}}));
     else if(req.url?.endsWith("/developer/transactions/transfer")) res.end(JSON.stringify({data:{id:key,state:"INITIATED"}}));
     else {res.statusCode=404;res.end("{}");}
@@ -34,7 +35,8 @@ it("encodes exact persisted terms through the installed Circle SDK HTTP transpor
       amountMicroUsdc:"9007199254740993",feeAllowanceMicroUsdc:"22",fee:{gasLimit:"21000",maxFeePerGasNative:"1000000001",maxPriorityFeePerGasNative:"100000000"}}))
       .resolves.toEqual({providerId:key,providerState:"INITIATED"});
     const posts=calls.filter(c=>c.method==="POST");expect(posts).toHaveLength(1);
-    expect(posts[0]!.body).toMatchObject({idempotencyKey:key,walletId,tokenAddress:ARC_USDC_ADDRESS,destinationAddress:recipient,
+    expect(posts[0]!.body).not.toHaveProperty("walletId");
+    expect(posts[0]!.body).toMatchObject({idempotencyKey:key,walletAddress,blockchain:"ARC-TESTNET",tokenAddress:ARC_USDC_ADDRESS,destinationAddress:recipient,
       amounts:["9007199254.740993"],gasLimit:"21000",maxFee:"1.000000001",priorityFee:"0.100000000"});
     expect(privateDecrypt({key:privateKey,padding:constants.RSA_PKCS1_OAEP_PADDING,oaepHash:"sha256"},Buffer.from(String(posts[0]!.body.entitySecretCiphertext),"base64")).toString("hex")).toBe(entitySecret);
   } finally {await new Promise<void>((resolve,reject)=>server.close(error=>error?reject(error):resolve()));}

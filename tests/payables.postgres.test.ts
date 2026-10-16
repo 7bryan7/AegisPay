@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { config } from "dotenv";
 import { Pool } from "pg";
@@ -13,8 +13,12 @@ import { syntheticPlanning } from "./support/planning.js";
 import { readPlanningState } from "../apps/server/src/treasury/ledger.js";
 import { preparePlanning } from "../apps/server/src/treasury/prepare.js";
 import { reserveNextPayment } from "../apps/server/src/payments/worker.js";
+import { resolveRejectedSubmission } from "../apps/server/src/payments/rejected-submission.js";
+import { CircleTransferError } from "../apps/server/src/payments/circle.js";
 import { dispatchNextPayment, recoverSubmittingPayments } from "../apps/server/src/payments/dispatch.js";
-import { reconcileNextPayment } from "../apps/server/src/payments/reconcile.js";
+import { reconcilePaymentForOperator, reconcileNextPayment } from "../apps/server/src/payments/reconcile.js";
+import { correctInvoice, evaluateInvoice, rejectInvoice } from "../apps/server/src/obligations/review.js";
+import { createAdministration } from "../apps/server/src/ap/administration.js";
 import { isExactApprovalValid, payableApprovalSchema } from "@agentpay/core";
 
 config({ quiet: true });
@@ -59,13 +63,21 @@ async function intent(business: string, id: string, decisionId: string) {
   return paymentId;
 }
 
-async function plannedPayment(approval = false) {
+async function plannedPayment(approval = false, discount = false) {
   const businessId=randomUUID(), manifest=syntheticEnrollment(businessId);
+  if (discount) {
+    manifest.purchaseOrders[0]!.dueDate = new Date(Date.now() + 30 * 86400000).toISOString().slice(0, 10);
+    manifest.purchaseOrders[0]!.verifiedDiscount = { discountedAmountMicroUsdc: "1200000",
+      validThrough: new Date(Date.now() + 86400000).toISOString().slice(0, 10), verifiedAt: new Date().toISOString(),
+      verificationReference: "owner:verified-full-settlement", settlesInFull: true };
+  }
   await enrollPayables(pool,{businessId,actorId:"synthetic-owner",role:"OPERATOR",paymentMode:"fixture"},manifest);
   await pool.query(`UPDATE ap_treasuries SET paused=false,policy=jsonb_set(policy,'{autoPayMaxMicroUsdc}',$2::jsonb) WHERE business_id=$1`,
     [businessId,JSON.stringify(approval?"1000000":"2000000")]);
   const saved=await upload(businessId);
-  await processNextObligation(pool,businessId,{modelId:"synthetic",extract:()=>Promise.resolve(syntheticPayable())},syntheticPlanning());
+  const raw = syntheticPayable();
+  if (discount) raw.dueDate = { value: manifest.purchaseOrders[0]!.dueDate, sourceText: manifest.purchaseOrders[0]!.dueDate, status: "EXTRACTED" };
+  await processNextObligation(pool,businessId,{modelId:"synthetic",extract:()=>Promise.resolve(raw)},syntheticPlanning());
   const decision=(await pool.query<{id:string}>("SELECT id FROM ap_decisions WHERE business_id=$1 AND obligation_id=$2",[businessId,saved.obligationId])).rows[0]!;
   return {businessId,manifest,obligationId:saved.obligationId,decisionId:decision.id};
 }
@@ -79,6 +91,9 @@ beforeAll(async () => {
   await pool.query("INSERT INTO providers (ens_name) VALUES ('legacy.example.eth')");
   await pool.query(await readFile(new URL("../migrations/004_payables.sql", import.meta.url), "utf8"));
   await pool.query(await readFile(new URL("../migrations/005_worker_status.sql", import.meta.url), "utf8"));
+  await pool.query(await readFile(new URL("../migrations/006_invoice_review.sql", import.meta.url), "utf8"));
+  await pool.query(await readFile(new URL("../migrations/007_registry_history.sql", import.meta.url), "utf8"));
+  await pool.query(await readFile(new URL("../migrations/008_verified_discount.sql", import.meta.url), "utf8"));
 });
 afterAll(async () => {
   await pool.end();
@@ -88,6 +103,179 @@ afterAll(async () => {
 });
 
 describe("AP PostgreSQL persistence", () => {
+  it("holds similar service-period invoices across different numbers and POs and stops an earlier unsubmitted decision", async () => {
+    const businessId = randomUUID(), manifest = syntheticEnrollment(businessId);
+    manifest.purchaseOrders.push({ ...manifest.purchaseOrders[0]!, id: "po-second" });
+    await enrollPayables(pool, { businessId, actorId: "owner", role: "OPERATOR", paymentMode: "fixture" }, manifest);
+    await pool.query("UPDATE ap_treasuries SET paused=false WHERE business_id=$1", [businessId]);
+    const first = await upload(businessId), field = (value: string) => ({ value, sourceText: value, status: "EXTRACTED" as const });
+    const raw = syntheticPayable(); raw.servicePeriod = field("September 2026");
+    await processNextObligation(pool, businessId, { modelId: "synthetic", extract: () => Promise.resolve(raw) }, syntheticPlanning());
+    await pool.query("UPDATE ap_obligations SET next_evaluation_at=now()+interval '5 minutes' WHERE business_id=$1 AND id=$2", [businessId, first.obligationId]);
+    const second = await ingestObligation(pool, { businessId, actorId: "owner", role: "OPERATOR", idempotencyKey: randomUUID(), purchaseOrderHint: null }, Buffer.concat([image, Buffer.from("similar-test")]), "image/png");
+    const changed = structuredClone(raw); changed.invoiceNumber = field("TEST-2"); changed.purchaseOrderReference = field("po-second");
+    await processNextObligation(pool, businessId, { modelId: "synthetic", extract: () => Promise.resolve(changed) }, syntheticPlanning());
+    expect((await createApStore(pool, 168).detail(businessId, second.obligationId))?.decision).toMatchObject({ action: "HOLD", reason: "SIMILAR_INVOICE_REQUIRES_REVIEW" });
+    await pool.query("UPDATE ap_obligations SET next_evaluation_at=now() WHERE business_id=$1 AND id=$2", [businessId, first.obligationId]);
+    const stopped = await reserveNextPayment(pool, businessId, new Date(), syntheticPlanning());
+    expect(stopped).toMatchObject({ status: "SKIPPED", reason: "SIMILAR_INVOICE_REQUIRES_REVIEW" });
+    expect((await pool.query("SELECT 1 FROM ap_payment_intents WHERE business_id=$1", [businessId])).rowCount).toBe(0);
+    expect((await createApStore(pool, 168).detail(businessId, first.obligationId))?.invoice.status).toBe("OPEN");
+  });
+  it("builds treasury metrics from the complete ledger and withholds liquidity for unresolved inclusion", async () => {
+    const p = await plannedPayment(), store = createApStore(pool, 168);
+    const before = await store.overview!(p.businessId, syntheticPlanning());
+    expect(before).toMatchObject({ status: "AVAILABLE", protectedObligationsMicroUsdc: "1500000" });
+    await reserveNextPayment(pool, p.businessId, new Date(), syntheticPlanning());
+    const held = await store.overview!(p.businessId, syntheticPlanning());
+    expect(held).toMatchObject({ status: "AVAILABLE", protectedObligationsMicroUsdc: "0", dailyHoldsMicroUsdc: "1500000" });
+    const providerId = randomUUID();
+    await dispatchNextPayment(pool, { dispatchEnabled: true, submit: () => Promise.resolve({ providerId, providerState: "INITIATED" }) }, p.businessId, syntheticPlanning());
+    const unknown = await store.overview!(p.businessId, syntheticPlanning());
+    expect(unknown).toMatchObject({ status: "UNAVAILABLE", reason: "CASH_INCLUSION_UNRESOLVED", spendableMicroUsdc: null });
+    expect((await store.overview!(p.businessId, null)).spendableMicroUsdc).toBeNull();
+  });
+  it("targets manual reconciliation by business and existing intent without any submission path", async () => {
+    const p = await plannedPayment();
+    const reserved = await reserveNextPayment(pool, p.businessId, new Date(), syntheticPlanning());
+    if (reserved.status !== "RESERVED") throw new Error("expected reserved intent");
+    await expect(reconcilePaymentForOperator(pool, "other-business", "owner", reserved.intentId, "Check existing intent", {})).rejects.toMatchObject({ code: "NOT_FOUND" });
+    expect(await reconcilePaymentForOperator(pool, p.businessId, "owner", reserved.intentId, "Check existing intent", {})).toMatchObject({ status: "WAITING", reason: "SUBMISSION_NOT_RECONCILABLE" });
+    const providerId = randomUUID();
+    await dispatchNextPayment(pool, { dispatchEnabled: true, submit: () => Promise.resolve({ providerId, providerState: "INITIATED" }) }, p.businessId, syntheticPlanning());
+    await expect(reconcilePaymentForOperator(pool, p.businessId, "owner", reserved.intentId, "Check existing intent", {})).rejects.toMatchObject({ code: "RECONCILIATION_UNAVAILABLE" });
+    let providerReads = 0;
+    const result = await reconcileNextPayment(pool, { getStatus: () => { providerReads++; throw new Error("Wrong target must not query provider"); } },
+      { read: () => { throw new Error("Wrong target must not query cash"); } }, { verify: () => { throw new Error("Wrong target must not query receipt"); } }, p.businessId, randomUUID());
+    expect(result.status).toBe("NO_UNRESOLVED"); expect(providerReads).toBe(0);
+    expect((await pool.query("SELECT 1 FROM ap_reservations WHERE business_id=$1 AND status='HELD'", [p.businessId])).rowCount).toBe(1);
+  });
+  it("versions registry updates, cancels affected reserved intents and refuses stale writes", async () => {
+    const { businessId, obligationId } = await plannedPayment(), admin = createAdministration(pool), context = { businessId, actorId: "owner" };
+    const reserved = await reserveNextPayment(pool, businessId, new Date(), syntheticPlanning());
+    if (reserved.status !== "RESERVED") throw new Error("expected reservation");
+    const vendor = (await admin.vendors(businessId)).vendors[0]!;
+    const updated = await admin.saveVendor(context, vendor.id, { expectedVersion: vendor.addressVersion,
+      address: `0x${"3".repeat(40)}`, verificationReference: "owner:updated-address", reason: "Owner verified changed address" });
+    expect(updated.addressVersion).toBe(vendor.addressVersion + 1);
+    expect((await createApStore(pool, 168).detail(businessId, obligationId))?.decision).toBeNull();
+    expect((await pool.query<{ state: string }>("SELECT state FROM ap_payment_intents WHERE id=$1", [reserved.intentId])).rows[0]?.state).toBe("CANCELLED");
+    await expect(admin.saveVendor(context, vendor.id, { expectedVersion: vendor.addressVersion, status: "BLOCKED", reason: "Stale update" })).rejects.toThrow("VERSION_CONFLICT");
+    await expect(admin.saveVendor(context, vendor.id, { expectedVersion: updated.addressVersion, address: "0x3600000000000000000000000000000000000000", reason: "Invalid recipient" })).rejects.toThrow("INVALID_RECIPIENT");
+    expect((await pool.query("SELECT 1 FROM ap_registry_revisions WHERE business_id=$1 AND kind='VENDOR'", [businessId])).rowCount).toBe(1);
+    await expect(pool.query("UPDATE ap_registry_revisions SET reason='overwrite' WHERE business_id=$1", [businessId])).rejects.toThrow();
+  });
+
+  it("creates scoped owner vendors/POs, validates evidence and serializes competing policy updates", async () => {
+    const { businessId, manifest } = await plannedPayment(), admin = createAdministration(pool), context = { businessId, actorId: "owner" };
+    const source = manifest.vendors[0]!;
+    const input = { id: "new-vendor", name: "Owner-approved supplier", aliases: [], status: "APPROVED" as const,
+      address: `0x${"4".repeat(40)}`, chainId: 5042002 as const, category: "office", settlementCurrency: "USD" as const,
+      settlementAgreementReference: "owner:agreement", verificationReference: "owner:address", verifiedAt: source.verifiedAt, reason: "Owner enrolled supplier" };
+    expect((await admin.saveVendor(context, null, input)).businessId).toBe(businessId);
+    await expect(admin.saveVendor(context, null, input)).rejects.toThrow("RECORD_EXISTS");
+    const po = await admin.savePurchaseOrder(context, null, { id: "new-po", vendorId: input.id, amountMicroUsdc: "9007199254740993",
+      deliveryAccepted: true, acceptanceReference: "owner:acceptance", description: "Owner-accepted obligation", dueDate: "2026-10-20", reason: "Verified acceptance" });
+    expect(po.outstandingMicroUsdc).toBe("9007199254740993");
+    const changed = await admin.savePurchaseOrder(context, po.id, { expectedVersion: 1, dueDate: "2026-10-21", reason: "Owner corrected terms" });
+    expect(changed.version).toBe(2);
+    await expect(admin.savePurchaseOrder(context, po.id, { expectedVersion: 2, acceptanceReference: null, reason: "Invalid acceptance" })).rejects.toThrow("INVALID_EVIDENCE");
+    expect((await admin.purchaseOrders(randomUUID())).purchaseOrders).toEqual([]);
+    const policy = await admin.policy(businessId), change = { expectedVersion: policy.version, policy: policy.policy, reason: "Owner reviewed budget" };
+    const results = await Promise.allSettled([admin.savePolicy(context, change), admin.savePolicy(context, change)]);
+    expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+    expect((await admin.policy(businessId)).version).toBe(policy.version + 1);
+  });
+
+  it("blocks purchase-order edits after ambiguous dispatch while allowing future vendor policy changes without releasing its hold", async () => {
+    const { businessId, obligationId, manifest } = await plannedPayment(), admin = createAdministration(pool), context = { businessId, actorId: "owner" };
+    const reserved = await reserveNextPayment(pool, businessId, new Date(), syntheticPlanning());
+    if (reserved.status !== "RESERVED") throw new Error("expected reservation");
+    await dispatchNextPayment(pool, { dispatchEnabled: true, submit: () => Promise.reject(new Error("synthetic timeout")) }, businessId, syntheticPlanning());
+    await expect(admin.savePurchaseOrder(context, manifest.purchaseOrders[0]!.id,
+      { expectedVersion: 1, amountMicroUsdc: "1000000", reason: "Cannot alter unresolved terms" })).rejects.toThrow("PAYMENT_IN_PROGRESS");
+    await admin.saveVendor(context, manifest.vendors[0]!.id, { expectedVersion: 1, status: "BLOCKED", reason: "Block future payments" });
+    const row = (await pool.query<{ state: string; status: string; version: number }>(`SELECT i.state,r.status,o.version FROM ap_payment_intents i
+      JOIN ap_reservations r ON r.business_id=i.business_id AND r.intent_id=i.id
+      JOIN ap_obligations o ON o.business_id=i.business_id AND o.id=i.obligation_id WHERE i.business_id=$1 AND o.id=$2`, [businessId, obligationId])).rows[0]!;
+    expect(row).toMatchObject({ state: "UNKNOWN", status: "HELD", version: 2 });
+  });
+  it("versions owner corrections, cancels only reserved money and preserves source provenance across re-evaluation", async () => {
+    const prepared = await plannedPayment(), { businessId, obligationId } = prepared;
+    const reservation = await reserveNextPayment(pool, businessId, new Date(), syntheticPlanning());
+    expect(reservation.status).toBe("RESERVED");
+    if (reservation.status !== "RESERVED") throw new Error("expected reservation");
+    const store = createApStore(pool, 168), current = (await store.detail(businessId, obligationId))!;
+    const input = { commandId: randomUUID(), expectedVersion: current.invoice.version, reason: "Owner checked accepted purchase order",
+      fields: { dueDate: { value: "2026-10-09", evidenceReference: "owner:po-acceptance" } } };
+    const context = { businessId, actorId: "owner" };
+    const corrected = await correctInvoice(pool, context, obligationId, input);
+    expect(corrected.version).toBe(current.invoice.version + 1);
+    expect(await correctInvoice(pool, context, obligationId, input)).toEqual(corrected);
+    await expect(correctInvoice(pool, context, obligationId, { ...input, reason: "Changed command input" })).rejects.toThrow("COMMAND_CONFLICT");
+    expect((await store.detail(businessId, obligationId))?.decision).toBeNull();
+    expect((await pool.query<{ state: string; status: string }>(`SELECT p.state,r.status FROM ap_payment_intents p
+      JOIN ap_reservations r ON r.business_id=p.business_id AND r.intent_id=p.id WHERE p.id=$1`, [reservation.intentId])).rows[0])
+      .toEqual({ state: "CANCELLED", status: "RELEASED" });
+    await processNextObligation(pool, businessId, null);
+    const detail = (await store.detail(businessId, obligationId))!;
+    expect(detail.facts?.evidence.find((item) => item.field === "dueDate"))
+      .toMatchObject({ status: "OPERATOR_VERIFIED", sourceReference: "owner:po-acceptance" });
+    const sources = (await pool.query<{ original_extraction: unknown; raw_extraction: unknown }>(
+      "SELECT original_extraction,raw_extraction FROM ap_obligations WHERE business_id=$1 AND id=$2", [businessId, obligationId])).rows[0]!;
+    expect(sources.raw_extraction).toEqual(syntheticPayable());
+    expect(sources.original_extraction).toEqual(syntheticPayable());
+    await expect(pool.query("UPDATE ap_obligations SET original_extraction='{}' WHERE business_id=$1 AND id=$2", [businessId, obligationId])).rejects.toThrow();
+    await expect(pool.query("DELETE FROM ap_invoice_revisions WHERE business_id=$1", [businessId])).rejects.toThrow();
+  });
+
+  it("fences an old model result, makes command retries idempotent and rejects concurrent/stale owner edits", async () => {
+    const businessId = randomUUID(); await treasury(businessId); const saved = await upload(businessId);
+    const claim = (await claimExtraction(pool, businessId))!;
+    const command = { commandId: randomUUID(), expectedVersion: claim.version, reason: "Review missing source facts" };
+    const context = { businessId, actorId: "owner" };
+    const outcomes = await Promise.all([evaluateInvoice(pool, context, saved.obligationId, command), evaluateInvoice(pool, context, saved.obligationId, command)]);
+    expect(outcomes[0]).toEqual(outcomes[1]);
+    expect(await finishExtraction(pool, claim, syntheticPayable(), null, "late-model")).toBe(false);
+    await expect(rejectInvoice(pool, context, saved.obligationId, { ...command, commandId: randomUUID() })).rejects.toThrow("VERSION_CONFLICT");
+    const newer = { ...command, commandId: randomUUID(), expectedVersion: outcomes[0].version };
+    const edits = await Promise.allSettled([
+      evaluateInvoice(pool, context, saved.obligationId, newer),
+      rejectInvoice(pool, context, saved.obligationId, { ...newer, commandId: randomUUID() })
+    ]);
+    expect(edits.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+    await expect(evaluateInvoice(pool, { businessId: randomUUID(), actorId: "other" }, saved.obligationId, newer)).rejects.toThrow("NOT_FOUND");
+  });
+
+  it("invalidates exact approvals and refuses review after submission without releasing funds", async () => {
+    const { businessId, obligationId, decisionId } = await plannedPayment(true), store = createApStore(pool, 168);
+    const offer = (await store.detail(businessId, obligationId))!.approvalOffer!;
+    await expect(store.approve(businessId, "owner", obligationId, decisionId, "Wrong confirmation", { ...offer, termsHash: "f".repeat(64) })).rejects.toThrow("APPROVAL_NOT_ELIGIBLE");
+    await store.approve(businessId, "owner", obligationId, decisionId, "Owner approved exact exception", offer);
+    await expect(store.approve(businessId, "owner", obligationId, decisionId, "Duplicate grant", offer)).rejects.toThrow("APPROVAL_ALREADY_EXISTS");
+    const version = (await store.detail(businessId, obligationId))!.invoice.version;
+    await evaluateInvoice(pool, { businessId, actorId: "owner" }, obligationId,
+      { commandId: randomUUID(), expectedVersion: version, reason: "Refresh source evaluation" });
+    const next = await reserveNextPayment(pool, businessId, new Date(), syntheticPlanning());
+    expect(next.status).not.toBe("RESERVED");
+    const other = await plannedPayment(), reserved = await reserveNextPayment(pool, other.businessId, new Date(), syntheticPlanning());
+    if (reserved.status !== "RESERVED") throw new Error("expected reservation");
+    expect((await dispatchNextPayment(pool, { dispatchEnabled: true, submit: () => Promise.reject(new Error("synthetic timeout")) },
+      other.businessId, syntheticPlanning())).status).toBe("UNKNOWN");
+    const current = (await store.detail(other.businessId, other.obligationId))!;
+    for (const mutate of [evaluateInvoice, rejectInvoice]) await expect(mutate(pool, { businessId: other.businessId, actorId: "owner" }, other.obligationId,
+      { commandId: randomUUID(), expectedVersion: current.invoice.version, reason: "Cannot change unresolved payable" })).rejects.toThrow("PAYMENT_IN_PROGRESS");
+    expect((await pool.query<{ status: string }>("SELECT status FROM ap_reservations WHERE business_id=$1", [other.businessId])).rows[0]?.status).toBe("HELD");
+  });
+
+  it("audits rejection and requires an available image for a requested re-extraction", async () => {
+    const businessId = randomUUID(); await treasury(businessId); const saved = await upload(businessId), context = { businessId, actorId: "owner" };
+    const rejected = await rejectInvoice(pool, context, saved.obligationId, { commandId: randomUUID(), expectedVersion: 1, reason: "Not an accepted business obligation" });
+    expect(rejected.status).toBe("REJECTED"); expect(await claimExtraction(pool, businessId)).toBeNull();
+    const second = await obligation(businessId);
+    await expect(evaluateInvoice(pool, context, second, { commandId: randomUUID(), expectedVersion: 1, reason: "Re-read source", reextract: true })).rejects.toThrow("INPUT_UNAVAILABLE");
+    expect((await pool.query("SELECT 1 FROM ap_events WHERE business_id=$1 AND entity_id=$2 AND event_type='INVOICE_REJECTED'", [businessId, saved.obligationId])).rowCount).toBe(1);
+  });
   it("persists scheduled planning and evidence atomically without reserving funds, surviving a fresh connection", async () => {
     const businessId = randomUUID(), manifest = syntheticEnrollment(businessId);
     const future = new Date(Date.now() + 86400000).toISOString().slice(0, 10);
@@ -251,6 +439,26 @@ describe("AP PostgreSQL persistence", () => {
     expect(await store.detail(other, saved.obligationId)).toBeNull();
     expect(await store.audit(other, saved.obligationId)).toBeNull();
     expect(await store.image(other, saved.obligationId)).toBeNull();
+  });
+  it("exposes owned source metadata without bytes and preserves the hash after source retention cleanup", async () => {
+    const business = randomUUID(), other = randomUUID(); await treasury(business); await treasury(other);
+    const saved = await upload(business), store = createApStore(pool,168);
+    const detail = await store.detail(business,saved.obligationId);
+    expect(detail?.source).toEqual({sha256:createHash("sha256").update(image).digest("hex"),mimeType:"image/png",byteSize:image.length,retained:true,uploadedBy:"test-owner"});
+    expect(detail?.verification).toMatchObject({status:"HOLD",reasons:["MISSING_OR_INVALID_EVIDENCE"]});
+    expect(JSON.stringify(detail)).not.toContain(image.toString("base64"));
+    expect(await store.detail(other,saved.obligationId)).toBeNull();
+    await pool.query("DELETE FROM ap_inputs WHERE business_id=$1 AND obligation_id=$2",[business,saved.obligationId]);
+    expect((await store.detail(business,saved.obligationId))?.source).toEqual({...detail!.source,mimeType:null,byteSize:null,retained:false});
+  });
+  it("reports current verification separately when acceptance changes after a stored decision", async () => {
+    const planned = await plannedPayment(true), store = createApStore(pool,168);
+    const before = await store.detail(planned.businessId,planned.obligationId);
+    expect(before?.verification).toEqual({status:"VERIFIED",reasons:[]});
+    await pool.query("UPDATE ap_purchase_orders SET delivery_accepted=false WHERE business_id=$1",[planned.businessId]);
+    const after = await store.detail(planned.businessId,planned.obligationId);
+    expect(after?.verification).toMatchObject({status:"HOLD",reasons:["DELIVERY_NOT_ACCEPTED"]});
+    expect(after?.decision?.id).toBe(before?.decision?.id);
   });
   it("migrates over legacy data without changing it", async () => {
     expect((await pool.query("SELECT ens_name FROM providers")).rows).toEqual([{ ens_name: "legacy.example.eth" }]);
@@ -462,13 +670,44 @@ describe("payment recovery and authorization", () => {
     const p=await plannedPayment();
     await reserveNextPayment(pool,p.businessId,new Date(),syntheticPlanning());
     let submissions=0;
-    const adapter={dispatchEnabled:true,submit:()=>{submissions++;throw new Error("timeout after acceptance");}};
+    const issue={code:"CIRCLE_UNAVAILABLE" as const,stage:"TRANSFER_REQUEST" as const,httpStatus:400,providerCode:"2",requestId:randomUUID()};
+    const adapter={dispatchEnabled:true,submit:()=>{submissions++;throw new CircleTransferError("CIRCLE_UNAVAILABLE",issue);}};
     expect((await dispatchNextPayment(pool,adapter,p.businessId,syntheticPlanning())).status).toBe("UNKNOWN");
     await recoverSubmittingPayments(pool,p.businessId);
     expect((await dispatchNextPayment(pool,adapter,p.businessId,syntheticPlanning())).status).toBe("NO_RESERVED");
     expect((await reserveNextPayment(pool,p.businessId,new Date(),syntheticPlanning())).status).toBe("NO_DUE");
     expect(submissions).toBe(1);
+    const detail=await createApStore(pool,168).detail(p.businessId,p.obligationId);
+    expect(detail?.payment).toMatchObject({state:"UNKNOWN",submissionIssue:issue});
+    const event=(await pool.query<{payload:{requestId:string}}>("SELECT payload FROM ap_events WHERE business_id=$1 AND event_type='PAYMENT_SUBMITTING'",[p.businessId])).rows[0];
+    expect(event?.payload.requestId).toMatch(/^[a-f0-9-]{36}$/);
     expect((await pool.query("SELECT 1 FROM ap_reservations WHERE business_id=$1 AND status='HELD'",[p.businessId])).rowCount).toBe(1);
+  });
+  it("closes only the exact human-confirmed validation rejection and invalidates its old authorization",async()=>{
+    const p=await plannedPayment();
+    const reserved=await reserveNextPayment(pool,p.businessId,new Date(),syntheticPlanning());
+    if(reserved.status!=="RESERVED")throw Error("reservation failed");
+    await dispatchNextPayment(pool,{dispatchEnabled:true,submit:()=>Promise.reject(Error("synthetic rejection"))},p.businessId,syntheticPlanning());
+    const original=(await pool.query<{submitted_at:Date}>("SELECT submitted_at FROM ap_payment_intents WHERE business_id=$1 AND id=$2",[p.businessId,reserved.intentId])).rows[0]!;
+    const proof={providerIdempotencyKey:reserved.providerIdempotencyKey,providerRequestId:"a".repeat(32),requestedAt:original.submitted_at.toISOString(),httpStatus:400,providerCode:2,reason:"TOKEN_ID_AND_BLOCKCHAIN_MISSING",evidenceReference:"synthetic:provider-log"};
+    for(const invalid of [{...proof,providerIdempotencyKey:randomUUID()},{...proof,requestedAt:"2020-01-01T00:00:00.000Z"},{...proof,httpStatus:500}]){
+      await expect(resolveRejectedSubmission(pool,p.businessId,reserved.intentId,"synthetic-operator",invalid)).rejects.toThrow();
+      expect((await createApStore(pool,168).detail(p.businessId,p.obligationId))?.payment?.state).toBe("UNKNOWN");
+    }
+    await expect(resolveRejectedSubmission(pool,"another-business",reserved.intentId,"synthetic-operator",proof)).rejects.toThrow();
+    const result=await resolveRejectedSubmission(pool,p.businessId,reserved.intentId,"synthetic-operator",proof);
+    expect(result.status).toBe("FAILED");
+    const detail=await createApStore(pool,168).detail(p.businessId,p.obligationId);
+    expect(detail?.invoice.version).toBe(result.version);expect(detail?.decision).toBeNull();expect(detail?.approvalOffer).toBeNull();
+    expect(detail?.payment?.state).toBe("FAILED");
+    const ledger=await readPlanningState(pool,p.businessId);
+    expect(ledger.payments[0]?.submissionRejection).toMatchObject({httpStatus:400,providerCode:2,providerRequestId:proof.providerRequestId,evidenceReference:proof.evidenceReference});
+    expect(ledger.payments[0]?.receipt).toBeNull();
+    expect((await reserveNextPayment(pool,p.businessId,new Date(),syntheticPlanning())).status).toBe("NO_DUE");
+    expect((await pool.query("SELECT 1 FROM ap_reservations WHERE business_id=$1 AND status='RELEASED'",[p.businessId])).rowCount).toBe(1);
+    const events=(await pool.query<{payload:unknown}>("SELECT payload FROM ap_events WHERE business_id=$1 AND event_type='PAYMENT_SUBMISSION_REJECTED'",[p.businessId])).rows;
+    expect(events).toHaveLength(1);expect(JSON.stringify(events)).not.toContain(reserved.providerIdempotencyKey);
+    await expect(resolveRejectedSubmission(pool,p.businessId,reserved.intentId,"synthetic-operator",proof)).rejects.toThrow();
   });
   it("recovers an expired submission lease to UNKNOWN with its original key and hold",async()=>{
     const p=await plannedPayment();
@@ -500,19 +739,40 @@ describe("payment recovery and authorization", () => {
 
 
 describe("atomic terminal evidence",()=>{
-  async function pending() {
-    const p=await plannedPayment();
+  async function pending(discount = false) {
+    const p=await plannedPayment(false, discount);
     await reserveNextPayment(pool,p.businessId,new Date(),syntheticPlanning());
     const providerId=randomUUID();
     await dispatchNextPayment(pool,{dispatchEnabled:true,submit:()=>Promise.resolve({providerId,providerState:"INITIATED"})},p.businessId,syntheticPlanning());
     const cash=await syntheticPlanning().readCash((await readPlanningState(pool,p.businessId)).treasury);
     const receipt={chainId:5042002,tokenAddress:"0x3600000000000000000000000000000000000000",walletAddress:p.manifest.treasury.walletAddress,
       recipient:p.manifest.vendors[0]!.address,blockNumber:"99",blockHash:`0x${"c".repeat(64)}`,cashBlockHash:cash.blockHash,
-      transactionHash:`0x${randomUUID().replaceAll("-", "").repeat(2)}`,amountMicroUsdc:"1500000",actualFeeMicroUsdc:"21",actualFeeNative:"21000000000000",outcome:"SUCCESS",verificationReference:"synthetic-independent-receipt"};
+      transactionHash:`0x${randomUUID().replaceAll("-", "").repeat(2)}`,amountMicroUsdc:discount?"1200000":"1500000",actualFeeMicroUsdc:"21",actualFeeNative:"21000000000000",outcome:"SUCCESS",verificationReference:"synthetic-independent-receipt"};
     const reconcile=(state="COMPLETE")=>reconcileNextPayment(pool,{getStatus:()=>Promise.resolve({providerId,providerState:state,transactionHash:receipt.transactionHash,errorReason:null})},
       {read:()=>Promise.resolve(cash)},{verify:()=>Promise.resolve(receipt)},p.businessId);
     return {...p,reconcile,receipt};
   }
+  it("settles a verified discounted full payment with exact payout and no nominal PO residual", async () => {
+    const p = await pending(true);
+    const stored = (await pool.query<{ terms: Record<string, string>; amount: string }>(
+      "SELECT terms,amount_micro_usdc::text AS amount FROM ap_payment_intents WHERE business_id=$1", [p.businessId])).rows[0]!;
+    expect(stored.amount).toBe("1200000");
+    expect(stored.terms).toMatchObject({ nominalAmountMicroUsdc: "1500000", discountAdjustmentMicroUsdc: "300000", amountMicroUsdc: "1200000" });
+    expect((await p.reconcile()).status).toBe("SETTLED");
+    const audit = await createApStore(pool, 168).audit(p.businessId, p.obligationId);
+    expect(audit?.payment).toMatchObject({ payoutAmountMicroUsdc: "1200000", nominalAmountMicroUsdc: "1500000", discountAdjustmentMicroUsdc: "300000" });
+    expect(audit?.decisions?.[0]?.treasury?.discountComparison).toMatchObject({ payoutAmountMicroUsdc: "1200000", discountAdjustmentMicroUsdc: "300000", cashPreservationCostMicroUsdc: "0" });
+    expect(audit?.decisions?.[0]?.versions).toMatchObject({ policy: 1, purchaseOrder: 1 });
+    expect((await pool.query<{ remaining: string }>("SELECT outstanding_micro_usdc::text AS remaining FROM ap_purchase_orders WHERE business_id=$1", [p.businessId])).rows[0]?.remaining).toBe("0");
+    expect((await p.reconcile()).status).toBe("NO_UNRESOLVED");
+  });
+  it("binds discounted approval offers and grants to nominal, adjustment and actual payout", async () => {
+    const p = await plannedPayment(true, true), store = createApStore(pool, 168);
+    const offer = (await store.detail(p.businessId, p.obligationId))?.approvalOffer;
+    expect(offer?.terms).toMatchObject({ amountMicroUsdc: "1200000", nominalAmountMicroUsdc: "1500000", discountAdjustmentMicroUsdc: "300000" });
+    await store.approve(p.businessId, "owner", p.obligationId, p.decisionId, "Reviewed exact discount", offer!);
+    expect((await reserveNextPayment(pool, p.businessId, new Date(), syntheticPlanning())).status).toBe("RESERVED");
+  });
   it("rolls back every settlement change on a PO conflict, then completes exactly once",async()=>{
     const p=await pending();
     await pool.query("UPDATE ap_purchase_orders SET outstanding_micro_usdc=1 WHERE business_id=$1",[p.businessId]);

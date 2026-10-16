@@ -1,7 +1,8 @@
+import {randomUUID} from "node:crypto";
 import * as circleSdk from "@circle-fin/developer-controlled-wallets";
 import type { CircleDeveloperControlledWalletsClient } from "@circle-fin/developer-controlled-wallets";
 import { z } from "zod";
-import { ARC_CHAIN_ID, ARC_USDC_ADDRESS, arcAddressSchema, microUsdcToUsdc, microUsdcStringSchema, usdcToMicroUsdc } from "@agentpay/core";
+import { ARC_CHAIN_ID, ARC_USDC_ADDRESS, arcAddressSchema, microUsdcToUsdc, microUsdcStringSchema, usdcToMicroUsdc, paymentSubmissionIssueSchema, type PaymentSubmissionIssue } from "@agentpay/core";
 
 const initiate = circleSdk.initiateDeveloperControlledWalletsClient
   ?? (circleSdk as { default?: { initiateDeveloperControlledWalletsClient?: typeof circleSdk.initiateDeveloperControlledWalletsClient } }).default?.initiateDeveloperControlledWalletsClient;
@@ -11,7 +12,7 @@ const positive = uint.refine((v) => v !== "0");
 const state = z.enum(["INITIATED", "QUEUED", "CLEARED", "SENT", "STUCK", "CONFIRMED", "COMPLETE", "FAILED", "CANCELLED", "DENIED"]);
 const termsSchema = z.strictObject({ walletId: uuid, recipient: arcAddressSchema,
   amountMicroUsdc: microUsdcStringSchema.refine((v) => v !== "0"), chainId: z.literal(ARC_CHAIN_ID), tokenAddress: z.literal(ARC_USDC_ADDRESS) });
-const requestSchema = termsSchema.extend({ providerIdempotencyKey: z.uuidv4(), feeAllowanceMicroUsdc: microUsdcStringSchema,
+const requestSchema = termsSchema.extend({ providerIdempotencyKey: z.uuidv4(), feeAllowanceMicroUsdc: microUsdcStringSchema, providerRequestId: z.uuid().optional(),
   fee: z.strictObject({ gasLimit: positive, maxFeePerGasNative: positive, maxPriorityFeePerGasNative: uint }) });
 const configSchema = z.strictObject({ mode: z.literal("arc_testnet"), apiKey: z.string().trim().min(1),
   entitySecret: z.string().regex(/^[a-fA-F0-9]{64}$/), walletId: uuid, walletAddress: arcAddressSchema,
@@ -35,9 +36,22 @@ export type CircleTransferClient = {
 };
 export class CircleTransferError extends Error {
   constructor(readonly code: "CIRCLE_NOT_CONFIGURED" | "CIRCLE_INVALID_RESPONSE" | "CIRCLE_UNAVAILABLE"
-    | "CIRCLE_TERMS_MISMATCH" | "CIRCLE_WALLET_MISMATCH" | "CIRCLE_FEE_LIMIT") {
+    | "CIRCLE_TERMS_MISMATCH" | "CIRCLE_WALLET_MISMATCH" | "CIRCLE_FEE_LIMIT", readonly submissionIssue?: PaymentSubmissionIssue) {
     super(code); this.name = "CircleTransferError";
   }
+}
+/** Never retain SDK messages/URLs/request bodies/ciphertexts. Only documented numeric codes/status and our correlation UUID. */
+function submissionError(error:unknown,stage:PaymentSubmissionIssue["stage"],requestId:string):CircleTransferError {
+ const record=error!==null&&typeof error==='object'?error as Record<string,unknown>:{};
+ const response=record.response!==null&&typeof record.response==='object'?record.response as Record<string,unknown>:{};
+ const status=record.status??response.status;
+ const data=response.data!==null&&typeof response.data==='object'?response.data as Record<string,unknown>:{};
+ const candidate=record.code??data.code;
+ const providerCode=(typeof candidate==='number'&&Number.isSafeInteger(candidate)||typeof candidate==='string')&&/^[0-9]{1,9}$/.test(String(candidate))?String(candidate):null;
+ const code=error instanceof CircleTransferError?error.code:'CIRCLE_UNAVAILABLE';
+ const issue=paymentSubmissionIssueSchema.parse({code,stage,requestId,providerCode,
+  httpStatus:typeof status==='number'&&Number.isInteger(status)&&status>=100&&status<=599?status:null});
+ return new CircleTransferError(code,issue);
 }
 const gwei = (v: string) => (BigInt(v) / 1_000_000_000n).toString() + "." + (BigInt(v) % 1_000_000_000n).toString().padStart(9, "0");
 // Bound worker waiting. A timeout cannot prove cancellation of the provider request.
@@ -81,26 +95,31 @@ export function createCircleTransferAdapter(rawConfig: CircleAdapterConfig, inje
       }
     },
     async submit(raw: unknown): Promise<CircleTransferResult> {
-      const request = requestSchema.safeParse(raw);
-      if (!request.success) throw new CircleTransferError("CIRCLE_TERMS_MISMATCH");
-      const r = request.data;
-      validateTerms({ walletId: r.walletId, recipient: r.recipient, amountMicroUsdc: r.amountMicroUsdc, chainId: r.chainId, tokenAddress: r.tokenAddress });
-      const worstFee = BigInt(r.fee.gasLimit) * BigInt(r.fee.maxFeePerGasNative);
-      if (BigInt(r.fee.maxPriorityFeePerGasNative) > BigInt(r.fee.maxFeePerGasNative)
-        || (worstFee + 999_999_999_999n) / 1_000_000_000_000n > BigInt(r.feeAllowanceMicroUsdc)) throw new CircleTransferError("CIRCLE_FEE_LIMIT");
+      const supplied=raw!==null&&typeof raw==='object'&&'providerRequestId' in raw?z.uuid().safeParse(raw.providerRequestId):null;
+      const requestId=supplied?.success?supplied.data:randomUUID();
+      let stage:PaymentSubmissionIssue["stage"]='VALIDATION';
       try {
+        const request = requestSchema.safeParse(raw);
+        if (!request.success) throw new CircleTransferError("CIRCLE_TERMS_MISMATCH");
+        const r = request.data;
+        validateTerms({ walletId: r.walletId, recipient: r.recipient, amountMicroUsdc: r.amountMicroUsdc, chainId: r.chainId, tokenAddress: r.tokenAddress });
+        const worstFee = BigInt(r.fee.gasLimit) * BigInt(r.fee.maxFeePerGasNative);
+        if (BigInt(r.fee.maxPriorityFeePerGasNative) > BigInt(r.fee.maxFeePerGasNative)
+          || (worstFee + 999_999_999_999n) / 1_000_000_000_000n > BigInt(r.feeAllowanceMicroUsdc)) throw new CircleTransferError("CIRCLE_FEE_LIMIT");
+        stage='WALLET_CHECK';
         await verifyWallet();
-        const response = await bounded(client.createTransaction({ walletId: r.walletId, tokenAddress: r.tokenAddress,
+        stage='TRANSFER_REQUEST';
+        const response = await bounded(client.createTransaction({ walletAddress: config.walletAddress, blockchain: config.blockchain, tokenAddress: r.tokenAddress, xRequestId:requestId,
           amount: [microUsdcToUsdc(BigInt(r.amountMicroUsdc))], destinationAddress: r.recipient, idempotencyKey: r.providerIdempotencyKey,
           fee: { type: "absolute", config: { gasLimit: r.fee.gasLimit,
             maxFee: gwei(r.fee.maxFeePerGasNative), priorityFee: gwei(r.fee.maxPriorityFeePerGasNative) } } }));
+        stage='TRANSFER_RESPONSE';
         const result = responseSchema.safeParse(response.data);
         if (!result.success) throw new CircleTransferError("CIRCLE_INVALID_RESPONSE");
         return { providerId: result.data.id, providerState: result.data.state };
       } catch (error) {
-        if (error instanceof CircleTransferError) throw error;
-        // Acceptance may precede a transport error. Keep the hold; never automatically replay.
-        throw new CircleTransferError("CIRCLE_UNAVAILABLE");
+        // Acceptance may precede a transport error. Diagnostics never authorize release or replay.
+        throw submissionError(error,stage,requestId);
       }
     },
     async getStatus(providerId: string, expected?: CircleExpectedTerms): Promise<CircleTransactionStatus> {

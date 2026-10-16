@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { microUsdcStringSchema } from "./amounts.js";
+import { compareVerifiedDiscount, verifiedDiscountSchema, cashPreservationCostBpsSchema } from "./discounts.js";
 import { dateOnlySchema } from "./obligations.js";
 
 export const payableActionSchema = z.enum(["PAY_NOW", "SCHEDULE", "HOLD", "REQUIRE_APPROVAL", "REJECT"]);
@@ -8,7 +9,8 @@ export const treasuryPolicySchema = z.strictObject({
   hardTxMaxMicroUsdc: microUsdcStringSchema,
   dailyBudgetMicroUsdc: microUsdcStringSchema,
   categoryBudgetMicroUsdc: microUsdcStringSchema,
-  minReserveMicroUsdc: microUsdcStringSchema
+  minReserveMicroUsdc: microUsdcStringSchema,
+  annualCashPreservationCostBps: cashPreservationCostBpsSchema.optional()
 }).refine((policy) => !microUsdcStringSchema.safeParse(policy.autoPayMaxMicroUsdc).success
   || !microUsdcStringSchema.safeParse(policy.hardTxMaxMicroUsdc).success
   || BigInt(policy.autoPayMaxMicroUsdc) <= BigInt(policy.hardTxMaxMicroUsdc),
@@ -31,6 +33,7 @@ export const treasurySnapshotSchema = z.strictObject({
 
 const eligibilityInputSchema = z.strictObject({
   now: z.iso.datetime(), dueDate: dateOnlySchema,
+  verifiedDiscount: verifiedDiscountSchema.nullable().optional(),
   amountMicroUsdc: microUsdcStringSchema.refine((value) => value !== "0"),
   verification: z.enum(["VERIFIED", "HOLD", "REJECT"]),
   duplicateOrSettled: z.boolean(),
@@ -72,7 +75,11 @@ export function evaluateTreasury(rawInput: unknown): TreasuryEligibility {
   if (snapshot.hasInFlightTransfer) return stop("HOLD", "UNRESOLVED_TRANSFER");
   const age = Date.parse(input.now) - Date.parse(snapshot.capturedAt);
   if (age < 0 || age > 30_000 || !snapshot.inclusionEvidenceVerified) return stop("HOLD", "STALE_OR_UNVERIFIED_CASH");
-  const amount = BigInt(input.amountMicroUsdc);
+  const discount = compareVerifiedDiscount({ nominalAmountMicroUsdc: input.amountMicroUsdc, dueDate: input.dueDate,
+    terms: input.verifiedDiscount ?? null, now: input.now, annualCashPreservationCostBps: policy.annualCashPreservationCostBps ?? 0 });
+  if (discount.status === "INVALID") return stop("HOLD", discount.reason);
+  const payout = discount.status === "AVAILABLE" ? discount.comparison.payoutAmountMicroUsdc : input.amountMicroUsdc;
+  const amount = BigInt(payout);
   if (amount > BigInt(policy.hardTxMaxMicroUsdc)) return stop("HOLD", "HARD_CEILING");
   const spendable = BigInt(snapshot.cashMicroUsdc) - BigInt(snapshot.unreflectedHoldsMicroUsdc)
     - BigInt(policy.minReserveMicroUsdc) - BigInt(snapshot.protectedObligationsMicroUsdc)
@@ -82,13 +89,13 @@ export function evaluateTreasury(rawInput: unknown): TreasuryEligibility {
   if (amount + BigInt(snapshot.categorySettledMicroUsdc) + BigInt(snapshot.categoryHoldsMicroUsdc) > BigInt(policy.categoryBudgetMicroUsdc)) return stop("HOLD", "CATEGORY_BUDGET");
   if (amount > BigInt(policy.autoPayMaxMicroUsdc) && !input.exactApprovalValid) return stop("REQUIRE_APPROVAL", "SOFT_THRESHOLD");
   const executeAt = `${input.dueDate}T09:00:00.000Z`;
-  const action = Date.parse(executeAt) <= Date.parse(input.now) ? "PAY_NOW" : "SCHEDULE";
+  const action = discount.status === "AVAILABLE" || Date.parse(executeAt) <= Date.parse(input.now) ? "PAY_NOW" : "SCHEDULE";
   return {
-    action, reasons: [action === "PAY_NOW" ? "DUE_AND_ELIGIBLE" : "VERIFIED_DUE_DATE"],
+    action, reasons: [discount.status === "AVAILABLE" ? "VERIFIED_DISCOUNT_SAVES_CASH" : action === "PAY_NOW" ? "DUE_AND_ELIGIBLE" : "VERIFIED_DUE_DATE"],
     candidates: [
-      { id: "due-date", action, amountMicroUsdc: input.amountMicroUsdc,
-        executeAt: action === "SCHEDULE" ? executeAt : null, evidenceIds: ["verified-obligation", "treasury-snapshot", "policy"] },
-      { id: "preserve-cash", action: "HOLD", amountMicroUsdc: input.amountMicroUsdc,
+      { id: discount.status === "AVAILABLE" ? "verified-discount" : "due-date", action, amountMicroUsdc: payout,
+        executeAt: action === "SCHEDULE" ? executeAt : null, evidenceIds: ["verified-obligation", "treasury-snapshot", "policy", ...(discount.status === "AVAILABLE" ? ["verified-discount"] : [])] },
+      { id: "preserve-cash", action: "HOLD", amountMicroUsdc: payout,
         executeAt: null, evidenceIds: ["treasury-snapshot"] }
     ]
   };

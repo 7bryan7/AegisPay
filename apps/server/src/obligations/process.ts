@@ -1,15 +1,16 @@
+import { similarInvoices } from "./similarity.js";
 import { randomUUID } from "node:crypto";
 import type { Pool, PoolClient } from "pg";
-import { normalizePayableExtraction, payableExtractionSchema, payableVendorSchema, purchaseOrderSchema,
+import { normalizeReviewedExtraction, payableExtractionSchema, payableVendorSchema, purchaseOrderSchema,
   verifyObligation, type NormalizedObligation, type PayableExtraction } from "@agentpay/core";
 import { PAYABLE_EXTRACTION_PROMPT, type PayableExtractor } from "../extraction/payable.js";
-import { validateInvoiceImage } from "../extraction/image.js";
+import { defaultInvoiceImageLimits, validateInvoiceImage, type InvoiceImageLimits } from "../extraction/image.js";
 import { preparePlanning, revalidatePlanning, heldDecision, type PlanningAdapters, type PreparedPlanning } from "../treasury/prepare.js";
 import { readPlanningState, planningFingerprint } from "../treasury/ledger.js";
 
 export type ExtractionClaim = {
   business_id: string; id: string; version: number; lease_owner: string;
-  raw_extraction: unknown; purchase_order_hint: string | null;
+  raw_extraction: unknown; purchase_order_hint: string | null; owner_corrections?: unknown;
 };
 
 /** Each claim has a fresh fencing token. An expired model call can never commit over its successor. */
@@ -25,6 +26,7 @@ export async function claimExtraction(pool: Pool, businessId: string): Promise<E
         JOIN ap_vendors v ON v.business_id=o.business_id AND v.id=o.vendor_id
         JOIN ap_purchase_orders p ON p.business_id=o.business_id AND p.id=o.purchase_order_id
         WHERE a.business_id=o.business_id AND a.obligation_id=o.id AND a.granted AND a.consumed_at IS NULL AND a.expires_at>now()
+          AND (a.terms->>'discountExpiresAt' IS NULL OR (a.terms->>'discountExpiresAt')::timestamptz>now())
           AND d.obligation_version=o.version AND d.policy_version=t.policy_version
           AND d.vendor_address_version=v.address_version AND d.purchase_order_version=p.version
           AND d.id=(SELECT id FROM ap_decisions WHERE business_id=o.business_id AND obligation_id=o.id ORDER BY evaluated_at DESC,id DESC LIMIT 1))
@@ -32,7 +34,7 @@ export async function claimExtraction(pool: Pool, businessId: string): Promise<E
   ) UPDATE ap_obligations o SET lease_owner = $2, lease_expires_at = now() + interval '3 minutes',
     status = CASE WHEN raw_extraction IS NULL THEN 'EXTRACTING' ELSE status END
     FROM job WHERE o.business_id = $1 AND o.id = job.id
-    RETURNING o.business_id, o.id, o.version, o.lease_owner, o.raw_extraction, o.purchase_order_hint`, [businessId, randomUUID()]);
+    RETURNING o.business_id, o.id, o.version, o.lease_owner, o.raw_extraction, o.purchase_order_hint, o.owner_corrections`, [businessId, randomUUID()]);
   return result.rows[0] ?? null;
 }
 
@@ -45,7 +47,7 @@ async function registry(client: PoolClient, facts: NormalizedObligation) {
     jsonb_build_object('businessId', p.business_id, 'id', p.id, 'vendorId', p.vendor_id, 'version', p.version,
       'amountMicroUsdc', p.amount_micro_usdc::text, 'outstandingMicroUsdc', p.outstanding_micro_usdc::text,
       'deliveryAccepted', p.delivery_accepted, 'acceptanceReference', p.acceptance_reference,
-      'description', p.description, 'dueDate', p.due_date::text,
+      'description', p.description, 'dueDate', p.due_date::text,'servicePeriod',p.service_period,'essential',p.essential,'verifiedDiscount',p.verified_discount,
       'activeObligationId', (SELECT id FROM ap_obligations WHERE business_id = p.business_id
         AND purchase_order_id = p.id AND status <> 'REJECTED' LIMIT 1)) AS po
     FROM ap_purchase_orders p JOIN ap_vendors v ON v.business_id = p.business_id AND v.id = p.vendor_id
@@ -74,7 +76,7 @@ export async function finishExtraction(pool: Pool, claim: ExtractionClaim, raw: 
       AND state IN ('RESERVED','SUBMITTING','PENDING','UNKNOWN','SETTLED')`, [claim.business_id, claim.id]);
     if (active.rowCount) { await client.query("ROLLBACK"); return false; }
     const version = claim.version + 1;
-    const normalized = normalizePayableExtraction(raw, { businessId: claim.business_id, id: claim.id, version });
+    const normalized = normalizeReviewedExtraction(raw, claim.owner_corrections, { businessId: claim.business_id, id: claim.id, version });
     const facts = normalized.status === "NORMALIZED" ? normalized.obligation : null;
     const records = facts ? await registry(client, facts) : { vendor: null, po: null };
     const verification = facts ? verifyObligation(facts, records.vendor, records.po) : null;
@@ -93,6 +95,11 @@ export async function finishExtraction(pool: Pool, claim: ExtractionClaim, raw: 
       if (duplicate.rowCount) {
         action = "REJECT"; reasons = ["DUPLICATE_INVOICE_IDENTITY"]; vendorId = null; poId = null;
       }
+    }
+    let similarInvoiceIds: string[] = [];
+    if (facts?.servicePeriod && vendorId && action !== "REJECT") {
+      similarInvoiceIds = await similarInvoices(client, facts, vendorId);
+      if (similarInvoiceIds.length) { action = "HOLD"; reasons = [...reasons, "SIMILAR_INVOICE_REQUIRES_REVIEW"]; }
     }
     let planning: PreparedPlanning | null = null;
     if (!reasons.length && facts && prepared) {
@@ -118,7 +125,7 @@ export async function finishExtraction(pool: Pool, claim: ExtractionClaim, raw: 
     const nextEvaluation = action === "PAY_NOW" ? evaluatedAt.toISOString()
       : action === "SCHEDULE" && planning?.decision.candidate?.executeAt
         ? planning.decision.candidate.executeAt : new Date(evaluatedAt.getTime() + 300_000).toISOString();
-    await client.query(`UPDATE ap_obligations SET raw_extraction = $5::jsonb, normalized = $6::jsonb,
+    await client.query(`UPDATE ap_obligations SET raw_extraction = $5::jsonb, original_extraction=COALESCE(original_extraction,$5::jsonb), normalized = $6::jsonb,
       vendor_id = $7, purchase_order_id = $8, normalized_invoice_number = $9,
       amount_micro_usdc = $10, currency = $11, issue_date = $12, due_date = $13,
       status = $14, version = $15, lease_owner = NULL, lease_expires_at = NULL,
@@ -145,6 +152,7 @@ export async function finishExtraction(pool: Pool, claim: ExtractionClaim, raw: 
       planning ? planning.decision.promptVersion : raw ? PAYABLE_EXTRACTION_PROMPT : null, treasury.rows[0]!.policy_version,
       records.vendor?.addressVersion ?? null, records.po?.version ?? null,
       JSON.stringify(planning?.accounting?.status === "READY" ? { available: true, ...planning.accounting,
+        discountComparison: planning.discountComparison ?? null, annualCashPreservationCostBps: (await readPlanningState(client, claim.business_id)).treasury.policy.annualCashPreservationCostBps ?? 0,
         cash: planning.evidence?.cash, fee: planning.evidence?.fee, ledgerAsOf: planning.evidence?.ledgerAsOf,
         ledgerFingerprint: finalFingerprint, dispatchEnabled: false } : { available: false }),
       evaluatedAt.toISOString(), expiresAt.toISOString(), JSON.stringify(planning?.decision.candidate ?? null)]);
@@ -152,7 +160,7 @@ export async function finishExtraction(pool: Pool, claim: ExtractionClaim, raw: 
       VALUES ($1,$2,'extraction-worker',$3,$4,'OBLIGATION_EVALUATED',$5::jsonb)`,
     [claim.business_id, `evaluated:${decisionId}`, claim.id, version,
       JSON.stringify({ decisionId, action, reasons, verification: verification?.status ?? "HOLD", dispatchEnabled: false,
-        proposal: planning?.decision.proposal ?? null, nextEvaluationAt: nextEvaluation,
+        similarInvoiceIds, proposal: planning?.decision.proposal ?? null, nextEvaluationAt: nextEvaluation,
         ledgerFingerprint: planning?.fingerprint ?? null })]);
     await client.query("COMMIT");
     return true;
@@ -161,7 +169,7 @@ export async function finishExtraction(pool: Pool, claim: ExtractionClaim, raw: 
 }
 
 export async function processNextObligation(pool: Pool, businessId: string, extractor: PayableExtractor | null,
-  planning: PlanningAdapters | null = null): Promise<boolean> {
+  planning: PlanningAdapters | null = null, limits: InvoiceImageLimits = defaultInvoiceImageLimits): Promise<boolean> {
   const claim = await claimExtraction(pool, businessId);
   if (!claim) return false;
   const cached = payableExtractionSchema.safeParse(claim.raw_extraction);
@@ -175,8 +183,7 @@ export async function processNextObligation(pool: Pool, businessId: string, extr
           "SELECT image_bytes, mime_type FROM ap_inputs WHERE business_id = $1 AND obligation_id = $2", [businessId, claim.id]);
         const image = input.rows[0];
         if (!image) throw new Error("INPUT_UNAVAILABLE");
-        raw = payableExtractionSchema.parse(await extractor.extract(validateInvoiceImage(image.image_bytes, image.mime_type,
-          { maxBytes: 5_000_000, maxPixels: 20_000_000 })));
+        raw = payableExtractionSchema.parse(await extractor.extract(validateInvoiceImage(image.image_bytes, image.mime_type, limits)));
       } catch { failure = "EXTRACTION_FAILED"; } // Never persist provider errors or raw exception text.
     }
   }

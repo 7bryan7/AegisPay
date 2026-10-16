@@ -1,6 +1,7 @@
+import { similarInvoices } from "../obligations/similarity.js";
 import type { Pool, PoolClient } from "pg";
 import { z } from "zod";
-import { accountTreasury, evaluateTreasury, isExactApprovalValid, normalizedObligationSchema, verifyObligation,
+import { paymentAmounts, accountTreasury, evaluateTreasury, isExactApprovalValid, normalizedObligationSchema, verifyObligation,
   cashEvidenceSchema, feeEvidenceSchema, paymentLedgerSchema, approvalTermsSchema, type TreasuryAccountingInput } from "@agentpay/core";
 import { planningFingerprint, readPlanningState, type PlanningState } from "../treasury/ledger.js";
 import type { PlanningAdapters } from "../treasury/prepare.js";
@@ -14,7 +15,7 @@ export const paymentEvidenceSchema = z.object({ cash: cashEvidenceSchema, fee: f
 export type PaymentEvidence = z.infer<typeof paymentEvidenceSchema>;
 export const commitmentsFor = (state: PlanningState): TreasuryAccountingInput["commitments"] => state.purchaseOrders.map((p) => ({
   businessId: p.businessId, purchaseOrderId: p.id, obligationId: p.activeObligationId, outstandingMicroUsdc: p.outstandingMicroUsdc,
-  dueDate: p.dueDate, accepted: p.deliveryAccepted, essential: true, status: p.outstandingMicroUsdc === "0" ? "SETTLED" : "OPEN"
+  dueDate: p.dueDate, accepted: p.deliveryAccepted, essential: p.essential ?? true, status: p.outstandingMicroUsdc === "0" ? "SETTLED" : "OPEN"
 }));
 export async function readPaymentEvidence(pool: Pool, businessId: string, recipient: string, amount: string, adapters: PlanningAdapters): Promise<PaymentEvidence> {
   const state = await readPlanningState(pool, businessId);
@@ -39,7 +40,8 @@ export async function authorizePayment(db: PoolClient, businessId: string, oblig
      JOIN ap_vendors v ON v.business_id=o.business_id AND v.id=o.vendor_id
      JOIN ap_purchase_orders p ON p.business_id=o.business_id AND p.id=o.purchase_order_id
      WHERE o.business_id=$1 AND o.id=$2 AND d.id=$3 FOR UPDATE OF o,v,p`, [businessId, obligationId, decisionId])).rows[0];
-  if (!row || row.status !== "OPEN" || row.latest !== decisionId || row.lease_owner) fail("PAYMENT_STALE_DECISION");
+  if (!row || row.status !== "OPEN" || row.latest !== decisionId || row.lease_owner
+    || row.obligation_version !== row.version || row.normalized === null) fail("PAYMENT_STALE_DECISION");
   const state = await readPlanningState(db, businessId);
   const facts = normalizedObligationSchema.parse(row.normalized);
   const po = state.purchaseOrders.find((p) => p.id === row.purchase_order_id);
@@ -49,10 +51,15 @@ export async function authorizePayment(db: PoolClient, businessId: string, oblig
     || row.obligation_version !== row.version || row.policy_version !== state.treasury.policyVersion
     || row.vendor_address_version !== vendor.addressVersion || row.purchase_order_version !== po.version
     || verifyObligation(facts, vendor, po).status !== "VERIFIED") fail("PAYMENT_VERSION_OR_VERIFICATION");
+  if ((await similarInvoices(db, facts, vendor.id)).length) fail("SIMILAR_INVOICE_REQUIRES_REVIEW");
+  let amounts;
+  try { amounts = paymentAmounts(facts.amountMicroUsdc, facts.dueDate, po.verifiedDiscount,
+    now.toISOString(), state.treasury.policy.annualCashPreservationCostBps); }
+  catch { return fail("INVALID_DISCOUNT_TERMS"); }
   const terms = approvalTermsSchema.parse({ businessId, obligationId, decisionId, walletId: state.treasury.walletId,
     obligationVersion: row.version, vendorId: vendor.id, vendorAddressVersion: vendor.addressVersion, purchaseOrderId: po.id,
     purchaseOrderVersion: po.version, policyVersion: state.treasury.policyVersion, recipient: vendor.address,
-    amountMicroUsdc: facts.amountMicroUsdc, chainId: state.treasury.chainId, token: state.treasury.tokenAddress });
+    ...amounts, chainId: state.treasury.chainId, token: state.treasury.tokenAddress });
   const grant = (await db.query<{ id: string; terms: unknown; actor_id: string; role: string; granted: boolean; reason: string;
     granted_at: Date; expires_at: Date; consumed_at: Date | null }>(
     "SELECT * FROM ap_approvals WHERE business_id=$1 AND decision_id=$2 FOR UPDATE", [businessId, decisionId])).rows[0];
@@ -65,7 +72,7 @@ export async function authorizePayment(db: PoolClient, businessId: string, oblig
   if (row.expires_at <= now && !(fresh && row.action === "REQUIRE_APPROVAL" && exactApprovalValid)) fail("PAYMENT_STALE_DECISION");
   if (row.action !== "REQUIRE_APPROVAL") {
     const candidate = z.object({ action: z.string(), amountMicroUsdc: z.string(), executeAt: z.iso.datetime().nullable() }).parse(row.candidate);
-    if (candidate.action !== row.action || candidate.amountMicroUsdc !== row.amount
+    if (candidate.action !== row.action || candidate.amountMicroUsdc !== amounts.amountMicroUsdc
       || (candidate.executeAt && Date.parse(candidate.executeAt) > now.getTime())) fail("PAYMENT_CANDIDATE_MISMATCH");
   }
   const stored = fresh ? null : z.object({ available: z.literal(true), cash: cashEvidenceSchema, fee: feeEvidenceSchema,
@@ -76,12 +83,12 @@ export async function authorizePayment(db: PoolClient, businessId: string, oblig
   // Own RESERVED intent is removed exactly once when testing whether its payout still fits.
   const payments = evidence.payments.filter((p) => p.intentId !== ownIntentId);
   const accounting = accountTreasury({ businessId, now: now.toISOString(), paused: state.treasury.paused, policy: state.treasury.policy,
-    candidate: { obligationId, purchaseOrderId: po.id, category: vendor.category, recipient: vendor.address, amountMicroUsdc: row.amount },
+    candidate: { obligationId, purchaseOrderId: po.id, category: vendor.category, recipient: vendor.address, amountMicroUsdc: amounts.amountMicroUsdc },
     cash: evidence.cash, fee: evidence.fee, payments, commitments: commitmentsFor(state), ledgerAsOf: evidence.ledgerAsOf,
     coverageFrom: "1970-01-01T00:00:00.000Z" });
   if (accounting.status !== "READY") fail(accounting.reasons[0] ?? "PAYMENT_ACCOUNTING_UNAVAILABLE");
   const snapshot = { ...accounting.snapshot, feeAllowanceMicroUsdc: feeAllowance ?? accounting.snapshot.feeAllowanceMicroUsdc };
-  const eligibility = evaluateTreasury({ now: now.toISOString(), dueDate: facts.dueDate, amountMicroUsdc: row.amount,
+  const eligibility = evaluateTreasury({ now: now.toISOString(), dueDate: facts.dueDate, amountMicroUsdc: facts.amountMicroUsdc, verifiedDiscount: po.verifiedDiscount ?? null,
     verification: "VERIFIED", duplicateOrSettled: false, screening: "LOCAL_REGISTRY", exactApprovalValid,
     policy: state.treasury.policy, snapshot });
   if (eligibility.action !== "PAY_NOW") fail(eligibility.reasons[0] ?? "PAYMENT_NOT_DUE");

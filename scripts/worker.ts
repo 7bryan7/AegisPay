@@ -8,6 +8,7 @@ import { processNextObligation } from "../apps/server/src/obligations/process.js
 import { cleanupExpiredInputs } from "../apps/server/src/obligations/ingest.js";
 import { createWorkerPlanning } from "../apps/server/src/treasury/runtime.js";
 import { reserveNextPayment } from "../apps/server/src/payments/worker.js";
+import { startWorkerHeartbeat } from "../apps/server/src/worker/heartbeat.js";
 import { jsonLog, loadRootEnv } from "./shared.js";
 
 loadRootEnv();
@@ -22,12 +23,13 @@ const stop = new AbortController(), planning = createWorkerPlanning(process.env)
 const circle = config.PAYMENT_MODE === "arc_testnet" ? createCircleAdapterFromEnvironment(process.env) : null;
 const reconciliation = circle ? createArcReconciliationFromEnvironment(process.env) : null;
 const dispatchEnabled = circle?.dispatchEnabled === true && planning !== null;
-async function heartbeat(healthy:boolean) {
+async function writeHeartbeat(healthy:boolean) {
   await pool.query(`INSERT INTO ap_worker_status (business_id,extraction_available,payment_available,dispatch_enabled,healthy)
     VALUES ($1,$2,$3,$4,$5) ON CONFLICT (business_id) DO UPDATE SET updated_at=now(),extraction_available=$2,
     payment_available=$3,dispatch_enabled=$4,healthy=$5`,
     [config.BUSINESS_ID,extractor!==null,circle!==null && reconciliation!==null && planning!==null,dispatchEnabled,healthy]);
 }
+const heartbeat = startWorkerHeartbeat(writeHeartbeat);
 process.once("SIGINT", () => stop.abort()); process.once("SIGTERM", () => stop.abort());
 jsonLog({ worker: "payables", extractionAvailable: extractor !== null, planningAvailable: planning !== null, dispatchEnabled, mode: config.PAYMENT_MODE });
 async function reserve() {
@@ -36,6 +38,7 @@ async function reserve() {
   if (result.status === "RESERVED") jsonLog({worker:"payment-reservation",status:result.status,intentId:result.intentId});
 }
 try {
+  await heartbeat.setHealthy(true);
   while (!stop.signal.aborted) {
     try {
       await recoverSubmittingPayments(pool,config.BUSINESS_ID);
@@ -46,7 +49,8 @@ try {
       }
       await reserve(); // Preserve exact approvals before re-evaluating other obligations.
       for (let count=0;count<10 && !stop.signal.aborted;count++) {
-        if (!await processNextObligation(pool,config.BUSINESS_ID,extractor,planning)) break;
+        if (!await processNextObligation(pool,config.BUSINESS_ID,extractor,planning,
+          { maxBytes: config.MAX_INPUT_BYTES, maxPixels: config.MAX_INPUT_PIXELS })) break;
         await reserve();
       }
       if (circle && planning) {
@@ -54,11 +58,11 @@ try {
         if (result.status!=="NO_RESERVED" && result.status!=="DISABLED") jsonLog({worker:"payment-dispatch",...result});
       }
       await cleanupExpiredInputs(pool,config.BUSINESS_ID);
-      await heartbeat(true);
+      await heartbeat.setHealthy(true);
     } catch {
-      await heartbeat(false).catch(()=>undefined);
+      await heartbeat.setHealthy(false);
       jsonLog({worker:"payables",error:"PROCESSING_UNAVAILABLE",dispatchEnabled});
     }
-    try { await setTimeout(30000,undefined,{signal:stop.signal}); } catch { /* Shutdown. */ }
+    try { await setTimeout(config.WORKER_POLL_MS,undefined,{signal:stop.signal}); } catch { /* Shutdown. */ }
   }
-} finally { await heartbeat(false).catch(()=>undefined); await pool.end(); }
+} finally { await heartbeat.stop(); await pool.end(); }

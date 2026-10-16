@@ -1,6 +1,6 @@
 import { readFile } from "node:fs/promises";
 import type { generateText } from "ai";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { createPayableExtractor } from "../apps/server/src/extraction/payable.js";
 import { validateInvoiceImage } from "../apps/server/src/extraction/image.js";
 import { syntheticPayable } from "./support/payable.js";
@@ -11,6 +11,31 @@ const bytes = await readFile(new URL("../fixtures/synthetic-invoice.png", import
 const image = validateInvoiceImage(bytes, "image/png", { maxBytes: 5_000_000, maxPixels: 20_000_000 });
 
 describe("AP extraction boundary", () => {
+  afterEach(() => vi.unstubAllGlobals());
+  it("sends a Gemini-compatible nested array schema through the actual SDK", async () => {
+    const raw = syntheticPayable();
+    const fetch = vi.fn((_input: unknown, init?: RequestInit) => {
+      if (typeof init?.body !== "string") throw new Error("Expected JSON request body");
+      const request = JSON.parse(init.body) as { generationConfig: {
+        responseSchema: { properties: { lineItems: { maxItems?: number } } }
+      } };
+      // The configured live model returned 400 when this nested bound was sent.
+      expect(request.generationConfig.responseSchema.properties.lineItems.maxItems).toBeUndefined();
+      return Promise.resolve(new Response(JSON.stringify({ candidates: [{ content: { role: "model", parts: [{ text: JSON.stringify(raw) }] },
+        finishReason: "STOP" }], usageMetadata: { promptTokenCount: 1, candidatesTokenCount: 1, totalTokenCount: 2 } }),
+      { status: 200, headers: { "content-type": "application/json" } }));
+    });
+    vi.stubGlobal("fetch", fetch);
+    await expect(createPayableExtractor(config).extract(image)).resolves.toEqual(raw);
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+  it("still rejects model output exceeding the canonical line-item limit", async () => {
+    const raw = syntheticPayable();
+    const field = { value: null, status: "MISSING" as const, sourceText: null };
+    raw.lineItems = Array.from({ length: 201 }, () => ({ description: field, quantity: field, unitPrice: field, amount: field }));
+    const generate = vi.fn(() => Promise.resolve({ output: raw })) as unknown as typeof generateText;
+    await expect(createPayableExtractor(config, generate).extract(image)).rejects.toThrow();
+  });
   it("preserves uncertainty and source facts through the structured output adapter", async () => {
     const raw = syntheticPayable();
     raw.dueDate = { value: "10/09/26", status: "AMBIGUOUS", sourceText: "10/09/26" };

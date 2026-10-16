@@ -14,6 +14,12 @@
 .ap-workspace form { display: grid; gap: 14px; }
 .ap-workspace label { display: grid; gap: 10px; font-size: .9rem; color: #d6dbd0; }
 .ap-workspace input { width: 100%; padding: 12px; border: 1px solid #535b49; background: #0d100a; border-radius: 6px; color: white; font: inherit; min-width: 0; }
+.ap-workspace select { width: 100%; padding: 12px; border: 1px solid #535b49; background: #0d100a; color: white; border-radius: 6px; font: inherit; min-width: 0; }
+.ap-workspace input[type="checkbox"] { width: auto; justify-self: start; }
+.ap-workspace details { border-top: 1px solid #363b31; padding-top: 14px; min-width: 0; }
+.ap-workspace summary { cursor: pointer; color: #d0f78d; padding: 8px 0; }
+.ap-review { display: grid; gap: 16px; min-width: 0; }
+.ap-upload > h3, .ap-upload > p { grid-column: 1 / -1; }
 .ap-workspace button { padding: 10px 16px; border: 1px solid #75824f; background: #d0f78d; color: #142100; font: inherit; font-size: .85rem; border-radius: 6px; cursor: pointer; width: fit-content; }
 .ap-workspace button:disabled { opacity: .45; cursor: not-allowed; }
 .ap-workspace button:hover:not(:disabled) { background: #e4ffb3; }
