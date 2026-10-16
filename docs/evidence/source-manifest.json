@@ -1,8 +1,8 @@
 {
-  "generatedAt": "2026-10-16T19:00:41.003Z",
+  "generatedAt": "2026-10-16T20:10:10.630Z",
   "node": "v22.23.3",
   "baseCommit": null,
-  "sourceFingerprint": "71887b37d53d5709982019d29e05e3f6eea1535002020c64651c7949ccfc0eaa",
+  "sourceFingerprint": "1c63e1a17513799d2665a794ed4e2fad6d5ce051e7ab3a3bc0d8e1a7a0b3129f",
   "scope": "AP source/config/tests/fixtures; excludes secrets, generated builds and private runtime data",
   "files": [
     {
@@ -95,7 +95,7 @@
     },
     {
       "path": "apps/server/src/extraction/payable.ts",
-      "sha256": "338c94d72f5b10165ef907e987257167eae07354ec640c8ed6a4081dedfe9248"
+      "sha256": "3fdea2a4f5ae3d72d4ae21e3cc09bb7a69175eb691343a195596fcfe3a876eb2"
     },
     {
       "path": "apps/server/src/http/errors.ts",
@@ -543,7 +543,7 @@
     },
     {
       "path": "packages/core/src/payables.test.ts",
-      "sha256": "b1b1d58f13e739343641ad0cebd033080fdb39d7e5391c1ef406255f0fa85ff4"
+      "sha256": "1d2a8b4c3d96a21495004b9f8537e4e21bb63a765ae800d94562e6050b9c18a3"
     },
     {
       "path": "packages/core/src/policy.ts",
@@ -591,7 +591,7 @@
     },
     {
       "path": "render.yaml",
-      "sha256": "160e0f0af5f697c4777e61cb77d4521788e35547b46314d3e6feeccce5b673b5"
+      "sha256": "af503e0e11f4a08f1540c29ec87f6d7510783722e9bd5b36c19934488c8fb037"
     },
     {
       "path": "scripts/db-migrate.ts",

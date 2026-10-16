@@ -6,7 +6,7 @@ services:
     runtime: node
     region: singapore
     plan: free
-    autoDeployTrigger: on
+    autoDeployTrigger: commit
     buildCommand: npm ci --include=dev && npm run build -w @agentpay/core && npm run build -w @agentpay/server
     startCommand: npm run start -w @agentpay/server
     healthCheckPath: /health
@@ -71,7 +71,7 @@ services:
     name: agentpay-worker
     runtime: node
     region: singapore
-    autoDeployTrigger: on
+    autoDeployTrigger: commit
     buildCommand: npm ci --include=dev && npm run build -w @agentpay/core && npm run build -w @agentpay/server
     startCommand: npm run worker
     envVars:

@@ -60,7 +60,8 @@ describe("obligation evidence", () => {
     expect(normalized.obligation.evidence.find((item) => item.field === "amountMicroUsdc")?.rawText).toBe("1.50");
     expect(verifyObligation(normalized.obligation, vendor, po).status).toBe("VERIFIED");
     for (const change of [{ currency: missing }, { dueDate: { value: "10/08/2026", status: "EXTRACTED", sourceText: "10/08/2026" } },
-      { total: { value: "1.0000001", status: "EXTRACTED", sourceText: "1.0000001" } }, { printedAddress: { ...missing, status: "AMBIGUOUS" } }]) {
+      { total: { value: "1.0000001", status: "EXTRACTED", sourceText: "1.0000001" } }, { printedAddress: { ...missing, status: "AMBIGUOUS" } },
+      { printedAddress: { value: "42 Arc Lane, Chennai, Tamil Nadu 600018, India", status: "EXTRACTED", sourceText: "42 Arc Lane, Chennai, Tamil Nadu 600018, India" } }]) {
       expect(normalizePayableExtraction({ ...raw, ...change }, identity).status).toBe("HOLD");
     }
   });
